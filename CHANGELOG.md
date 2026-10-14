@@ -10,6 +10,31 @@ exported API" in [`CONTRIBUTING.md`](./CONTRIBUTING.md)).
 
 ### Added
 
+- **`httpauth`: protect a resource and hand each request the caller's own
+  token** (Path A, #1). A `Protector` wraps a handler in purser's
+  `CallerMiddleware`, built with `Enforce` and no `Fallback` so a refused
+  request can never run as anyone, around a `googletoken.Authenticator`.
+  Behind it, `TokenSourceFromContext` gives the person's own Google token
+  (with its expiry) and `IdentityFromContext` their verified identity, for
+  calling Google APIs and GKE as them. It serves RFC 9728 Protected Resource
+  Metadata naming Google as the authorization server, and every 401 names
+  it. The resource URL must be https except on loopback, since clients send
+  the user's token to it, and advertised scopes must be RFC 6749 scope
+  tokens. A `Protector` is an `httpmw.Gate`, so purser's `CheckBind`
+  accepts it for a non-loopback bind.
+- **`mcpauth`: bind MCP sessions to the person who opened them, and give
+  each call its own token.** For a server on the MCP Go SDK with stateful
+  sessions, `Middleware` runs the `Protector` and then the SDK's
+  `RequireBearerToken` with a `TokenInfo` built from the verified identity,
+  so the SDK refuses (403) a session ID presented by another person. Tool
+  handlers read the person's token and identity with `TokenSource(req)` and
+  `Identity(req)`, which come from the HTTP request carrying that call: the
+  SDK runs every call with the session's first context, so a context
+  accessor would hand a tool the token from initialize, stale within the
+  hour. The raw `Authorization` header is removed before the SDK sees the
+  request. The only package that imports the SDK (v1.8.0, matching
+  k8s-lookout).
+
 - **`googletoken`: verify the Google access tokens a client sends for a
   person** (Path A, #1). `Verifier` accepts a token only if Google's
   tokeninfo says it is unexpired, was issued to one of the service's own

@@ -113,9 +113,10 @@ force-push `main`. Full contributor flow + DCO in
 
 ## Current state
 
-**Phase 2a: Path A verification.** `googletoken` (the verifier and a
-purser authenticator, moved from supercargo) and `allow` are in, on purser
-v0.2.0. Next: `httpauth` (the token-source middleware and RFC 9728
-metadata) and `mcpauth`, then tag v0.1.0 for k8s-lookout and supercargo to
-adopt. No release yet, so `verify-apidiff` has no baseline. See the phase
-table in [`docs/DESIGN.md`](./docs/DESIGN.md).
+**Phase 2b: Path A complete, unreleased.** `googletoken` (the verifier and
+a purser authenticator, moved from supercargo), `allow`, `httpauth` (the
+Protector: purser's enforced middleware, the token source, RFC 9728
+metadata) and `mcpauth` (SDK session binding) are in, on purser v0.2.0.
+Next: tag v0.1.0 for k8s-lookout and supercargo to adopt. No release yet,
+so `verify-apidiff` has no baseline. See the phase table in
+[`docs/DESIGN.md`](./docs/DESIGN.md).

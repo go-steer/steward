@@ -29,3 +29,8 @@ github.com/go-steer/steward/allow             100.0
 # (http.NewRequestWithContext only fails on a malformed URL, which New's
 # defaults and the tests never supply).
 github.com/go-steer/steward/googletoken        96.0  # 97.4
+
+# Wiring. httpauth's remainder is New's arms for a json.Marshal or
+# purser NewCaller failure that its own validation makes unreachable.
+github.com/go-steer/steward/httpauth           96.0  # 97.4
+github.com/go-steer/steward/mcpauth           100.0

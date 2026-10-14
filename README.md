@@ -12,12 +12,43 @@ to and whether that person is let in, then hands the service a
 **as that person**. What they can see is then what their own IAM and
 Kubernetes RBAC allow.
 
-> **Status: phase 2a, unreleased.** Token verification (`googletoken`) and
-> admission (`allow`) are in; the request wiring is next. The first release
-> (v0.1.0) is Path A: accepting the per-user tokens a Gemini Enterprise app
-> sends to a Custom MCP Server.
-> See [`docs/DESIGN.md`](./docs/DESIGN.md) and the
+> **Status: Path A complete, unreleased.** Verification (`googletoken`),
+> admission (`allow`), request wiring (`httpauth`) and MCP session binding
+> (`mcpauth`) are in; v0.1.0 is next. See
+> [`docs/DESIGN.md`](./docs/DESIGN.md) and the
 > [Path A issue](https://github.com/go-steer/steward/issues/1).
+
+## Use
+
+Protect an MCP endpoint that a Gemini Enterprise app calls with each
+person's Google token, and read Google APIs as that person:
+
+```go
+v, err := googletoken.New(googletoken.Config{
+	ClientIDs:      []string{oauthClientID}, // the client Gemini Enterprise is configured with
+	RequiredScopes: []string{"https://www.googleapis.com/auth/cloud-platform"},
+	Logger:         slog.Default(), // so a Google outage is visible
+})
+admit, err := allow.Parse([]string{"@example.com", "contractor@gmail.com"})
+a, err := googletoken.NewAuthenticator(v, admit)
+p, err := httpauth.New(httpauth.Options{
+	Authenticator: a,
+	Resource:      "https://svc.example.com/mcp",
+	Scopes:        []string{"openid", "email", "https://www.googleapis.com/auth/cloud-platform"},
+})
+
+mux.Handle(p.MetadataPath(), p.MetadataHandler())  // RFC 9728, unauthenticated
+mux.Handle("/mcp", mcpauth.Middleware(p)(mcpHandler)) // or p.Middleware() for stateless HTTP
+
+// In an MCP tool handler (stateful sessions): read from the request, not
+// the context, which the SDK freezes at the session's first request.
+ts, _ := mcpauth.TokenSource(req) // the person's own Google token, for this call
+id, _ := mcpauth.Identity(req)    // id.Email, id.HD, id.Subject
+
+// In a plain HTTP handler behind p.Middleware():
+caller, _ := purser.CallerFromContext(r.Context())   // caller.Identity is the email
+ts, _ = httpauth.TokenSourceFromContext(r.Context()) // their own Google token
+```
 
 ## Why it exists
 

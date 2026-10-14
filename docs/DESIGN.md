@@ -111,22 +111,58 @@ An empty list admits no one.
   wrap `ErrUnauthenticated` (purser#23), `googletoken.Config.Logger`
   logs every `ErrUnavailable`, without the token, so an operator can tell
   the two apart.
-- A steward middleware, placed after purser's, attaches the verified
-  token's `oauth2.TokenSource` to the request context
-  (`steward.TokenSourceFromContext`). It runs only when purser's verdict
-  for the request is Google's, so it never trusts a header purser did not
-  verify.
-- A handler serves RFC 9728 Protected Resource Metadata naming Google as
-  the authorization server, and the 401 challenge points at it
-  (`resource_metadata`).
+- An `httpauth.Protector` builds that middleware itself and wraps it
+  around a second layer that attaches the verified token as an
+  `oauth2.TokenSource` (`httpauth.TokenSourceFromContext`) and its
+  `googletoken.Identity` (`httpauth.IdentityFromContext`). That layer acts
+  only when purser's verdict for the request is Google's, so it never
+  trusts a header purser did not verify, and it re-reads the identity from
+  the Verifier's cache, so the token's expiry rides on the token source.
+  The accessors live in `httpauth`, not the root package, so the root
+  imports nothing.
+- The token source does not refresh. The client holds the refresh token
+  (Gemini Enterprise does) and sends a fresh access token on a later
+  request.
+- The Protector serves RFC 9728 Protected Resource Metadata naming Google
+  as the authorization server, at the well-known path RFC 9728 §3.1
+  derives from the resource URL, and every 401 challenge points at it
+  (`resource_metadata`, plus `scope` when scopes are configured). The
+  resource URL must be https, except for a loopback host, because clients
+  send the user's Google token to it. The Protector is an `httpmw.Gate`,
+  so purser's `CheckBind` accepts it for a non-loopback bind.
 
 ### MCP (`mcpauth`)
 
-The only package that imports the MCP Go SDK. It adapts steward's caller
-to the SDK's `auth.TokenInfo`, so a service that runs stateful MCP
-sessions gets each session bound to its caller (the SDK refuses a session
-ID presented by another user). A service that runs stateless HTTP does not
-need it.
+The only package that imports the MCP Go SDK. The SDK's streamable HTTP
+handler refuses a session ID presented by a different user than the one
+who opened it (403), but only when it finds an `auth.TokenInfo` with a
+`UserID` on the request, and only the SDK's own `auth.RequireBearerToken`
+can put one there. `mcpauth.Middleware` therefore runs the Protector and
+then `RequireBearerToken` with a verifier that checks nothing itself: it
+converts the already-verified identity into a `TokenInfo` whose `UserID`
+is Google's `sub` (the email if Google sent none, since an empty `UserID`
+turns binding off). A service that runs stateless HTTP has no sessions to
+bind and does not need it.
+
+**The token inside a tool handler comes from the request, not the
+context.** In a stateful session the SDK runs every call with a context
+derived from the session's first request (initialize), so context values
+attached to a later request never reach the handler, and
+`httpauth.TokenSourceFromContext` would return the token from initialize,
+which expires within the hour while the client keeps sending fresh ones.
+What the SDK does pass per call is that HTTP request's `TokenInfo`
+(`req.Extra`). So `mcpauth` puts the request's token source and identity in
+`TokenInfo.Extra`, and tool handlers read them with
+`mcpauth.TokenSource(req)` and `mcpauth.Identity(req)`. The person cannot
+change within a session (the binding enforces it); the token can. Found by
+the adversarial review of the wiring PR; `TestToolSeesCurrentToken` pins
+it.
+
+`mcpauth` also strips `Authorization` before the SDK handler, so the raw
+token is not in `req.Extra.Header` for a tool (or a header-logging layer) to
+find. The SDK writes its own 401 in two edge cases (a `TokenInfo` whose
+expiry passed between the layers, or a missing one); its challenge names the
+metadata but not the scopes.
 
 ### Browser sign-in (`signin`)
 
@@ -191,7 +227,10 @@ Minimal, per go-steer policy:
 
 - `github.com/go-steer/purser` — the caller contract.
 - `golang.org/x/oauth2` — token sources and the sign-in exchange.
-- `github.com/modelcontextprotocol/go-sdk` — only in `mcpauth`.
+- `github.com/modelcontextprotocol/go-sdk` — only in `mcpauth`, pinned to
+  the version k8s-lookout uses (v1.8.0). Its `auth` package brings
+  `segmentio/encoding` and `segmentio/asm`; they are compiled only into a
+  service that imports `mcpauth`.
 
 ## Testing
 
@@ -209,7 +248,7 @@ limit). Ported tests keep their supercargo coverage.
 |---|---|---|
 | 0 | Repository, tooling, this design | done |
 | 1 | The two purser additions | done: purser v0.2.0 |
-| 2a | Path A verification: `googletoken`, `allow` (emails, domains) | steward#1 |
+| 2a | Path A verification: `googletoken`, `allow` (emails, domains) | done: steward#3 |
 | 2b | Path A wiring: `httpauth`, `mcpauth`; tag v0.1.0 | steward#1 |
 | 3 | k8s-lookout and supercargo adopt v0.1.0 | k8s-lookout#699 |
 | 4 | `signin`; `allow` groups | steward#1 |
