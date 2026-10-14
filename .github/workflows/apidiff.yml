@@ -1,0 +1,58 @@
+# Copyright 2026 Google LLC
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
+# The exported surface is the product — steward is consumed as a Go module,
+# so a removed field breaks a consumer's build at `go get`. apidiff compares
+# the module's exported API against the last release tag and fails on
+# incompatible changes that dev/api-breaks.txt does not acknowledge; see the
+# header of dev/tools/verify-apidiff for the escape hatch.
+#
+# Its own workflow rather than a step in `ci`, for two reasons. It needs the
+# full history (fetch-depth: 0) to resolve the baseline tag, and paying that
+# clone cost on the main job would slow every PR for a check that finishes in
+# seconds. And it is deliberately NOT in the required set on `main`: every
+# required check is a check that can wedge the queue, and this one has a
+# failure mode the others don't — it depends on a tag being fetchable, so a
+# mirror hiccup or a forced tag move turns into a red required check on
+# unrelated PRs. It runs on every PR and its verdict is visible; make it
+# required once it has a release cycle of clean history behind it.
+#
+# Until the first v* tag exists it skips cleanly (nothing to compare against).
+name: apidiff
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+jobs:
+  apidiff:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          # Tags and history: the baseline is `git describe`'s nearest
+          # reachable v* tag, which a shallow clone cannot see.
+          fetch-depth: 0
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+      - name: API diff since last release
+        run: dev/ci/presubmits/verify-apidiff

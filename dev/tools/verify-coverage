@@ -1,0 +1,267 @@
+#!/usr/bin/env bash
+# Copyright 2026 Google LLC
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
+# Hold every package to its statement-coverage floor in
+# dev/coverage-floors.txt.
+#
+# Why a floor at all, in a repo that already reviews its tests:
+#
+#   steward decides who a Google token belongs to and whether to act on
+#   it. Its characteristic failure is not a test that fails — it is a
+#   verification branch that no test ever reaches, which reports
+#   "authenticated" for the same reason a correct implementation would.
+#   Coverage cannot tell a real assertion from a vacuous one (purser's
+#   PR #13 found four tests that passed with their defense removed), so
+#   this is not a quality bar. It is the narrower claim that every branch was at least
+#   executed once — the floor under review, not a substitute for it.
+#
+# Why per-package floors rather than one number for the module:
+#
+#   A repo-wide percentage lets a large, easily-covered package fund the
+#   gaps in a small dangerous one; authtest alone could carry a hole in
+#   authn/oidc. Per-package, a regression names the package it happened
+#   in. Every package in the profile must have an entry, so a new package
+#   cannot arrive unmeasured — the same reason verify-apidiff runs in
+#   module mode rather than over a hardcoded package list.
+#
+# Why a checked-in file rather than a flag:
+#
+#   Same bargain as dev/api-breaks.txt. Lowering a floor is legitimate,
+#   and it should cost one reviewable diff hunk in the PR that lowers it,
+#   next to the code that made it necessary.
+#
+# Usage:
+#   dev/tools/verify-coverage             # uses ./coverage.out, regenerating
+#                                         # it if absent or older than a .go file
+#   COVERAGE_PROFILE=x.out dev/tools/...  # check an existing profile, never regenerate
+#   COVERAGE_FLOORS=other.txt dev/...     # alternate floors file
+#
+# Exit: 0 ok, 1 a package is below/missing a floor, 3 the floors file is
+# malformed.
+set -euo pipefail
+. "$(dirname "$0")/common.sh"
+cd "$(repo_root)"
+
+FLOORS="${COVERAGE_FLOORS:-dev/coverage-floors.txt}"
+DEFAULT_PROFILE="coverage.out"
+PROFILE="${COVERAGE_PROFILE:-$DEFAULT_PROFILE}"
+
+# How far above its floor a package may drift before the floor has stopped
+# saying anything. Advisory: printed, never fatal. A gate that goes red for
+# *gaining* coverage teaches people to stop reading it.
+RATCHET_SLACK="${COVERAGE_RATCHET_SLACK:-2.0}"
+
+if [[ ! -f "$FLOORS" ]]; then
+  echo "verify-coverage: floors file not found: $FLOORS" >&2
+  exit 1
+fi
+
+# Only the default profile is ours to (re)generate. An explicitly named one
+# belongs to the caller — silently overwriting coverage.out underneath them,
+# or measuring a profile they meant to supply, would both be wrong.
+regenerate() {
+  echo "▸ $1 — running dev/tools/test-unit" >&2
+  dev/tools/test-unit >&2
+}
+
+if [[ "$PROFILE" == "$DEFAULT_PROFILE" ]]; then
+  if [[ ! -f "$PROFILE" ]]; then
+    regenerate "no $PROFILE"
+  elif [[ -n "$(find . -name '*.go' -newer "$PROFILE" -not -path './.git/*' -print -quit)" ]]; then
+    # A stale profile is the one way this check fails open: it would happily
+    # pass a package whose tests were deleted an hour ago.
+    regenerate "$PROFILE is older than a .go file"
+  fi
+elif [[ ! -f "$PROFILE" ]]; then
+  echo "verify-coverage: profile not found: $PROFILE" >&2
+  echo "  (COVERAGE_PROFILE is set, so this script will not generate one.)" >&2
+  exit 1
+fi
+
+WORKDIR="$(mktemp -d)"
+trap 'rm -rf "$WORKDIR"' EXIT
+
+# Per-package statement coverage out of the profile.
+#
+# `go tool cover -func` reports per function and prints a single total, so
+# neither of its two granularities is the one being gated. The arithmetic is
+# the same either way: a block counts as covered when its execution count is
+# nonzero, weighted by the number of statements in it.
+#
+# Blocks are deduplicated by max count. `go test ./...` without -coverpkg
+# emits each block once, but -coverpkg or a merged profile can repeat one, and
+# summing the repeats would weight those packages' statements twice over.
+awk '
+  NR == 1 && /^mode:/ { next }
+  NF != 3 { next }
+  {
+    key = $1
+    stmts[key] = $2 + 0
+    c = $3 + 0
+    if (!(key in count) || c > count[key]) count[key] = c
+  }
+  END {
+    for (key in stmts) {
+      file = key
+      sub(/:[0-9]+\.[0-9]+,[0-9]+\.[0-9]+$/, "", file)
+      pkg = file
+      sub(/\/[^\/]+$/, "", pkg)
+      total[pkg] += stmts[key]
+      if (count[key] > 0) covered[pkg] += stmts[key]
+      seen[pkg] = 1
+    }
+    for (pkg in seen) {
+      # A package with no statements at all is vacuously covered; reporting
+      # it as 0% would demand a floor of 0 for an empty file.
+      pct = (total[pkg] > 0) ? 100.0 * covered[pkg] / total[pkg] : 100.0
+      printf "%s %.1f\n", pkg, pct
+    }
+  }
+' "$PROFILE" | sort > "$WORKDIR/actual.txt"
+
+if [[ ! -s "$WORKDIR/actual.txt" ]]; then
+  # A module with no statements yet (only doc.go) produces an empty
+  # profile. That is vacuously covered only while the floors file lists
+  # nothing either; the first package with code must add a floor, and then
+  # an empty profile is a broken test run again.
+  if ! grep -qvE '^[[:space:]]*(#.*)?$' "$FLOORS"; then
+    echo "verify-coverage: no statements and no floors yet — nothing to check."
+    exit 0
+  fi
+  echo "verify-coverage: $PROFILE contains no coverage blocks." >&2
+  echo "  Expected the profile dev/tools/test-unit writes (mode: atomic)." >&2
+  exit 1
+fi
+
+echo "statement coverage vs $FLOORS"
+echo
+
+# Floors first, then the measured packages. Comparison is on the value as
+# printed, to one decimal: a package shown as 97.0% must not fail a floor of
+# 97.0 because it is really 96.98.
+set +e
+awk -v slack="$RATCHET_SLACK" -v floors="$FLOORS" '
+  # Counting iterations rather than length(): the glyphs are multi-byte, and
+  # length() counts bytes under a non-UTF-8 locale — which CI often has.
+  function bar(pct,   n, i, s) {
+    n = int(pct / 5 + 0.5)
+    s = ""
+    for (i = 0; i < 20; i++) s = s (i < n ? "█" : "·")
+    return s
+  }
+
+  # Pass 1: the floors file.
+  FNR == NR {
+    line = $0
+    sub(/#.*/, "", line)
+    gsub(/^[ \t\r]+|[ \t\r]+$/, "", line)
+    if (line == "") next
+    n = split(line, f, /[ \t]+/)
+    if (n != 2 || f[2] !~ /^[0-9]+(\.[0-9]+)?$/ || f[2] + 0 > 100) {
+      printf("%s:%d: expected \"<import-path> <floor>\", got: %s\n", FILENAME, FNR, $0) > "/dev/stderr"
+      cfgerr = 1
+      next
+    }
+    if (f[1] in floor) {
+      printf("%s:%d: duplicate entry for %s\n", FILENAME, FNR, f[1]) > "/dev/stderr"
+      cfgerr = 1
+      next
+    }
+    floor[f[1]] = f[2] + 0
+    order[++nfloors] = f[1]
+    next
+  }
+
+  # Pass 2: the measured packages, already sorted.
+  {
+    pkg = $1
+    pct = $2 + 0
+    present[pkg] = 1
+
+    if (!(pkg in floor)) {
+      unlisted[++nunlisted] = sprintf("  %-56s %5.1f%%", pkg, pct)
+      suggest[nunlisted] = sprintf("%-56s %5.1f", pkg, (pct >= 1) ? int(pct) - 1 : 0)
+      printf("  %-56s %5.1f%%  %s  (no floor)\n", pkg, pct, bar(pct))
+      next
+    }
+
+    fl = floor[pkg]
+    if (pct < fl) {
+      printf("  %-56s %5.1f%%  %s  ✗ floor %.1f%%\n", pkg, pct, bar(pct), fl)
+      failed[++nfailed] = sprintf("  %-56s %5.1f%%  floor %.1f%%  (short by %.1f)", pkg, pct, fl, fl - pct)
+    } else {
+      printf("  %-56s %5.1f%%  %s    floor %.1f%%\n", pkg, pct, bar(pct), fl)
+      # int(pct), not pct: the replacement floor keeps the point of headroom
+      # the originals have. Suppressed unless that is actually a raise, so a
+      # small COVERAGE_RATCHET_SLACK cannot suggest the floor already in place.
+      if (pct - fl >= slack + 0 && int(pct) > fl) {
+        raise[++nraise] = sprintf("  %-56s %5.1f  # was %.1f, now %.1f%%", pkg, int(pct), fl, pct)
+      }
+    }
+  }
+
+  END {
+    # 3, not 2: gawk exits 2 on its own fatal errors, and reporting one of
+    # those as "your floors file is malformed" would send the reader to the
+    # wrong file.
+    if (cfgerr) exit 3
+
+    # A floor naming a package that no longer exists is not harmless: it is
+    # a claim nothing checks, and it reads as coverage the repo does not have.
+    for (i = 1; i <= nfloors; i++) {
+      if (!(order[i] in present)) stale[++nstale] = "  " order[i]
+    }
+
+    print ""
+    if (nunlisted > 0) {
+      printf("%d package(s) in the profile have no floor in %s:\n\n", nunlisted, floors) > "/dev/stderr"
+      for (i = 1; i <= nunlisted; i++) print unlisted[i] > "/dev/stderr"
+      print "\nAdd an entry for each — a package with no floor is a package no\none is holding to anything. Suggested lines (a point under the\ncurrent number, so ordinary churn does not turn an unrelated PR red):\n" > "/dev/stderr"
+      for (i = 1; i <= nunlisted; i++) print "  " suggest[i] > "/dev/stderr"
+      print "" > "/dev/stderr"
+    }
+
+    if (nstale > 0) {
+      printf("%d floor(s) name a package that is not in the profile:\n\n", nstale) > "/dev/stderr"
+      for (i = 1; i <= nstale; i++) print stale[i] > "/dev/stderr"
+      print "\nIf the package was renamed or removed, update or drop the entry in\nthe same PR. If it still exists, it produced no coverage blocks —\nwhich usually means it has no .go files left, or the profile is stale.\n" > "/dev/stderr"
+    }
+
+    if (nfailed > 0) {
+      printf("%d package(s) below their coverage floor:\n\n", nfailed) > "/dev/stderr"
+      for (i = 1; i <= nfailed; i++) print failed[i] > "/dev/stderr"
+      printf("\nCover the new branches, or — if the drop is deliberate and the\nuncovered code is genuinely unreachable from a test — lower the floor\nin %s in this PR, with a comment saying why.\nLowering it silently is the one thing the file exists to prevent.\n\n", floors) > "/dev/stderr"
+    }
+
+    if (nraise > 0) {
+      printf("%d floor(s) now sit more than %s points under the truth, and have\n", nraise, slack)
+      printf("stopped protecting much. Raising them is not required to merge:\n\n")
+      for (i = 1; i <= nraise; i++) print raise[i]
+      print ""
+    }
+
+    if (nfailed > 0 || nunlisted > 0 || nstale > 0) exit 1
+    printf("✓ %d package(s) at or above their floor\n", nfloors)
+  }
+' "$FLOORS" "$WORKDIR/actual.txt"
+status=$?
+set -e
+
+case "$status" in
+  3) echo "verify-coverage: $FLOORS is malformed (see above)." >&2 ;;
+  0|1) ;;
+  *) echo "verify-coverage: awk failed (exit $status) — this is a bug in this script." >&2 ;;
+esac
+exit "$status"
