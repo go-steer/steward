@@ -1,0 +1,19 @@
+# Per-package statement-coverage floors. Read and enforced by
+# dev/tools/verify-coverage against the profile dev/tools/test-unit writes.
+#
+# One entry per package: "<import path> <floor>". Blank lines and everything
+# after a `#` are ignored. Every package in the coverage profile needs an
+# entry — a new package with no floor fails the check rather than slipping in
+# unmeasured.
+#
+# The floors are per package rather than one number for the module because a
+# single repo-wide percentage is exactly the metric that lets a 100%-covered
+# package hide an untested branch in another. Averaging is what makes
+# coverage gates worthless; this file refuses to average.
+#
+# A floor is a ratchet, not a target. It sits a point or so under the real
+# number so ordinary churn doesn't turn an unrelated PR red, and lowering one
+# is a reviewable diff hunk in the PR that lowers it — the same bargain
+# dev/api-breaks.txt makes for the exported API. Raise a floor when a package
+# earns it; verify-coverage nags when one has drifted far enough below the
+# truth to have stopped meaning anything.
