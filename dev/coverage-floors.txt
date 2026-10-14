@@ -17,3 +17,15 @@
 # dev/api-breaks.txt makes for the exported API. Raise a floor when a package
 # earns it; verify-coverage nags when one has drifted far enough below the
 # truth to have stopped meaning anything.
+#
+# Numbers in the trailing comments are what the packages measured when the
+# floor was last set (2026-10-14).
+
+# Admission. Small and pure: every branch is reachable, so 100 is the
+# current state rather than a goal.
+github.com/go-steer/steward/allow             100.0
+
+# Verification. Short of 100 for the request-construction error arms
+# (http.NewRequestWithContext only fails on a malformed URL, which New's
+# defaults and the tests never supply).
+github.com/go-steer/steward/googletoken        96.0  # 97.4
