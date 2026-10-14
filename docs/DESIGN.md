@@ -64,10 +64,20 @@ Bounds, so that garbage tokens cannot turn into a flood of calls to Google:
 - Results are cached by SHA-256 of the token, never the token itself, for
   at most 10 minutes or the token's own expiry, whichever is sooner.
 - A refusal is remembered for 30 s.
-- At most 8 lookups run at once; past that a new token is refused.
+- At most 8 lookups run at once; past that a token not in the cache is
+  turned away as unavailable (load-shedding, not a verdict).
 - At most 1024 cache entries.
-- Google failing (no answer, 429, 5xx) is an error, **never** cached as a
-  refusal. Google refusing (any other non-200) is `ErrInvalid`.
+- Only a complete non-2xx answer other than 429 is Google refusing
+  (`ErrInvalid`, cached). Everything else is `ErrUnavailable` and
+  **never** cached: no answer, 429, 5xx, a body cut short (the client went
+  away, a timeout fired, the connection dropped), and a 200 that does not
+  parse. Caching a half-read answer as a refusal would let one
+  disconnecting client lock a person's valid token out for 30 s.
+- `exp` and `email_verified` are accepted as strings (what Google sends
+  today), numbers or booleans, so a type change at Google cannot turn
+  every token into a refusal.
+- A lookup slot is released however the lookup ends, including a panic in
+  a caller-supplied transport.
 
 ### Admission (`allow`)
 
@@ -89,6 +99,18 @@ An empty list admits no one.
   `authn.CredentialGate`, so it runs inside purser's
   `httpmw.CallerMiddleware`, which already owns attaching the caller,
   enforcement, the proxy-assertion path and the 401.
+- **The middleware must be built with `Enforce` and no `Fallback`.** With
+  `Enforce` off, purser gives every failed request `CallerOptions.Fallback`;
+  a Fallback naming the service would serve unadmitted people as the
+  service, which breaks "no fallback identity". `httpauth` builds the
+  middleware itself, so a consumer cannot get this wrong through steward.
+- **Under `Enforce`, an unavailable Google is a 401 too.** purser maps every
+  authentication error to 401 and logs none of them, so a Google outage
+  looks like a wave of bad tokens, and MCP clients typically answer a 401
+  by signing in again. Until purser has a 503 path for errors that do not
+  wrap `ErrUnauthenticated` (purser#23), `googletoken.Config.Logger`
+  logs every `ErrUnavailable`, without the token, so an operator can tell
+  the two apart.
 - A steward middleware, placed after purser's, attaches the verified
   token's `oauth2.TokenSource` to the request context
   (`steward.TokenSourceFromContext`). It runs only when purser's verdict
@@ -185,9 +207,10 @@ limit). Ported tests keep their supercargo coverage.
 
 | Phase | Content | Tracked |
 |---|---|---|
-| 0 | Repository, tooling, this design | — |
-| 1 | The two purser additions | purser |
-| 2 | Path A: `googletoken`, `allow` (emails, domains), `httpauth`, `mcpauth`; tag v0.1.0 | steward#1 |
+| 0 | Repository, tooling, this design | done |
+| 1 | The two purser additions | done: purser v0.2.0 |
+| 2a | Path A verification: `googletoken`, `allow` (emails, domains) | steward#1 |
+| 2b | Path A wiring: `httpauth`, `mcpauth`; tag v0.1.0 | steward#1 |
 | 3 | k8s-lookout and supercargo adopt v0.1.0 | k8s-lookout#699 |
 | 4 | `signin`; `allow` groups | steward#1 |
 | 5 | Path B | k8s-lookout#702 |

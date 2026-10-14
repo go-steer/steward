@@ -12,9 +12,10 @@ to and whether that person is let in, then hands the service a
 **as that person**. What they can see is then what their own IAM and
 Kubernetes RBAC allow.
 
-> **Status: phase 0.** The repository and the design are in place; there is
-> no exported API yet. The first release (v0.1.0) is Path A: accepting the
-> per-user tokens a Gemini Enterprise app sends to a Custom MCP Server.
+> **Status: phase 2a, unreleased.** Token verification (`googletoken`) and
+> admission (`allow`) are in; the request wiring is next. The first release
+> (v0.1.0) is Path A: accepting the per-user tokens a Gemini Enterprise app
+> sends to a Custom MCP Server.
 > See [`docs/DESIGN.md`](./docs/DESIGN.md) and the
 > [Path A issue](https://github.com/go-steer/steward/issues/1).
 
