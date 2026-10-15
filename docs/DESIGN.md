@@ -25,8 +25,8 @@ one caller type however the caller arrived.
 
 | Consumer | Uses | Status |
 |---|---|---|
-| go-steer/k8s-lookout | Path A: Gemini Enterprise users read clusters as themselves (k8s-lookout#699) | planned |
-| go-steer/supercargo | Path A: its `internal/googleauth` moves here, and supercargo adopts steward | planned |
+| go-steer/k8s-lookout | Path A: Gemini Enterprise users read clusters as themselves (k8s-lookout#699) | planned, on v0.1.0 |
+| go-steer/supercargo | Path A: the source of `googletoken`; adopting steward would replace its `internal/googleauth` | deferred (2026-10-15): supercargo stays as it is for now; port fixes by hand |
 
 ## Path A — the client holds the user's token
 
@@ -249,7 +249,7 @@ limit). Ported tests keep their supercargo coverage.
 | 0 | Repository, tooling, this design | done |
 | 1 | The two purser additions | done: purser v0.2.0 |
 | 2a | Path A verification: `googletoken`, `allow` (emails, domains) | done: steward#3 |
-| 2b | Path A wiring: `httpauth`, `mcpauth`; tag v0.1.0 | steward#1 |
-| 3 | k8s-lookout and supercargo adopt v0.1.0 | k8s-lookout#699 |
+| 2b | Path A wiring: `httpauth`, `mcpauth`; tag v0.1.0 | done: steward#4, v0.1.0 |
+| 3 | k8s-lookout adopts v0.1.0 (supercargo deferred) | k8s-lookout#699 |
 | 4 | `signin`; `allow` groups | steward#1 |
 | 5 | Path B | k8s-lookout#702 |

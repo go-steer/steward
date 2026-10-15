@@ -17,4 +17,4 @@
 # sit behind the new baseline, and a leftover entry would silently permit
 # a second, unrelated removal of a symbol that no longer exists.
 #
-# (empty — no release tag yet, so verify-apidiff has no baseline)
+# (empty — nothing has been broken since v0.1.0)
