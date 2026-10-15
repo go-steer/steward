@@ -12,9 +12,10 @@ to and whether that person is let in, then hands the service a
 **as that person**. What they can see is then what their own IAM and
 Kubernetes RBAC allow.
 
-> **Status: Path A complete, unreleased.** Verification (`googletoken`),
-> admission (`allow`), request wiring (`httpauth`) and MCP session binding
-> (`mcpauth`) are in; v0.1.0 is next. See
+> **Status: v0.1.0, Path A.** Verification (`googletoken`), admission
+> (`allow`), request wiring (`httpauth`) and MCP session binding
+> (`mcpauth`). Pin [`v0.1.0`](./CHANGELOG.md) rather than a commit.
+> Pre-1.0, the exported API may break at a minor version. See
 > [`docs/DESIGN.md`](./docs/DESIGN.md) and the
 > [Path A issue](https://github.com/go-steer/steward/issues/1).
 

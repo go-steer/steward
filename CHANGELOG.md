@@ -8,6 +8,21 @@ exported API" in [`CONTRIBUTING.md`](./CONTRIBUTING.md)).
 
 ## [Unreleased]
 
+*Nothing yet.*
+
+## [0.1.0] - 2026-10-15
+
+Path A: a go-steer service can accept the per-user Google access tokens a
+Gemini Enterprise app sends to a Custom MCP Server, decide who gets in, and
+act as that person.
+
+**What v0.1.0 is for.** k8s-lookout's per-user identity
+(k8s-lookout#699) needs a tag to pin rather than a commit, and
+`verify-apidiff` needs a baseline: before this tag it had nothing to compare
+against and skipped every run. Built on purser v0.2.0. Browser sign-in,
+group allow-lists and Path B (a service as its own authorization server)
+come later.
+
 ### Added
 
 - **`httpauth`: protect a resource and hand each request the caller's own
@@ -74,3 +89,6 @@ exported API" in [`CONTRIBUTING.md`](./CONTRIBUTING.md)).
   later), the hard rules, and the phase plan. The `dev/` tooling, CI,
   adversarial-review gate and agent-attribution check follow purser and
   supercargo. No exported API yet.
+
+[Unreleased]: https://github.com/go-steer/steward/compare/v0.1.0...HEAD
+[0.1.0]: https://github.com/go-steer/steward/releases/tag/v0.1.0
