@@ -12,12 +12,13 @@ to and whether that person is let in, then hands the service a
 **as that person**. What they can see is then what their own IAM and
 Kubernetes RBAC allow.
 
-> **Status: v0.1.0, Path A.** Verification (`googletoken`), admission
-> (`allow`), request wiring (`httpauth`) and MCP session binding
-> (`mcpauth`). Pin [`v0.1.0`](./CHANGELOG.md) rather than a commit.
-> Pre-1.0, the exported API may break at a minor version. See
-> [`docs/DESIGN.md`](./docs/DESIGN.md) and the
-> [Path A issue](https://github.com/go-steer/steward/issues/1).
+> **Status: Path A and Path B.** Verification (`googletoken`), admission
+> by email, domain and Google group (`allow`), request wiring
+> (`httpauth`), MCP session binding (`mcpauth`), and steward's own OAuth
+> 2.1 authorization server (`authserver`, with token sealing in `seal`).
+> Pin a [release](./CHANGELOG.md) rather than a commit. Pre-1.0, the
+> exported API may break at a minor version. See
+> [`docs/DESIGN.md`](./docs/DESIGN.md).
 
 ## Use
 
@@ -51,6 +52,41 @@ caller, _ := purser.CallerFromContext(r.Context())   // caller.Identity is the e
 ts, _ = httpauth.TokenSourceFromContext(r.Context()) // their own Google token
 ```
 
+Add Path B for generic MCP clients (Claude Code, gemini-cli, IDEs), which
+discover an authorization server and register with it: mount steward's in
+front of Google sign-in, and let the same Protector accept its tokens too:
+
+```go
+keys, err := secretmanager.NewProvider(secretmanager.Source{
+	Client:  smClient, // authorized with secretmanager.Scope
+	Version: "projects/my-project/secrets/svc-keys/versions/latest",
+}, 0, slog.Default())
+groups := &allow.CloudIdentityGroups{Client: ciClient} // Groups Reader
+list, err := allow.Parse([]string{"@example.com", "group:svc-users@example.com"})
+admitter, err := allow.NewAdmitter(list, groups)
+as, err := authserver.New(authserver.Config{
+	Issuer:   "https://svc.example.com",
+	Resource: "https://svc.example.com/mcp",
+	Scopes:   []string{"svc:read", "svc:write"},
+	Google:   googleClient, // authserver.LoadGoogleClient(path); register as.CallbackURL() with it
+	Custody:  &authserver.VaultCustody{AuthProvider: authProvider, Client: vaultClient},
+	Admit:    admitter,
+	Keys:     keys,
+	OpenRegistration: true, // DCR and Client ID Metadata Documents
+})
+as.Register(mux) // metadata, /authorize, /callback, /token, /register, ...
+p, err := httpauth.New(httpauth.Options{
+	Authenticator: a,  // Path A, as above (optional)
+	AuthServer:    as, // Path B
+	Resource:      "https://svc.example.com/mcp",
+})
+
+// A person arrives the same way on either path (mcpauth.TokenSource,
+// mcpauth.Identity). A workload that used client credentials has no
+// person: mcpauth.Principal(req) (or httpauth.PrincipalFromContext) says
+// p.Workload, and p.Scopes holds the granted service scopes.
+```
+
 ## Why it exists
 
 Several go-steer services need the same thing: let a person reach the
@@ -73,8 +109,8 @@ proof of a Workspace domain.
 
 | Path | Who holds the user's Google grant | For | Status |
 |---|---|---|---|
-| **A** | The client (Gemini Enterprise); the service checks the token it sends | Gemini Enterprise Custom MCP Servers | first |
-| **B** | The service, as its own OAuth 2.1 authorization server | MCP clients that register dynamically (Claude Code, gemini-cli, IDEs) | later |
+| **A** | The client (Gemini Enterprise); the service checks the token it sends | Gemini Enterprise Custom MCP Servers | v0.1.0 |
+| **B** | The service, as its own OAuth 2.1 authorization server | MCP clients that register dynamically (Claude Code, gemini-cli, IDEs) | v0.2.0 |
 
 ## Development
 

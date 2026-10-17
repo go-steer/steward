@@ -10,6 +10,29 @@ exported API" in [`CONTRIBUTING.md`](./CONTRIBUTING.md)).
 
 ### Added
 
+- **`httpauth`: one Protector for both paths.** `Options.AuthServer`
+  makes a `Protector` accept steward's own access tokens as well as Google
+  ones (`Options.Authenticator` is now optional; one of the two is
+  required). A request is routed by its token's shape to purser's enforced
+  middleware around the right verifier. A person reaches the handler the
+  same way on either path, with `TokenSourceFromContext` and
+  `IdentityFromContext`; a steward token also yields the
+  `authserver.Principal` (`PrincipalFromContext`), which is all a
+  client-credentials workload gets (even one whose service account's token
+  rides in its access token). The metadata names steward's issuer and its
+  service scopes; the 401 challenge names the server's `DefaultScopes`
+  (`authserver.Server.DefaultScopes`), so generic clients ask for least
+  privilege. `Options.RequiredScopes` refuses a steward token without them
+  with a 403 `insufficient_scope` step-up challenge. A steward token at a
+  Protector without an `AuthServer` is refused locally, never sent to
+  Google.
+- **`mcpauth`: Path B in tool handlers.** For a steward token the SDK
+  session's `UserID` is the person's Google `sub` (as on Path A, so one
+  person's session continues across both paths) or `client:<id>` for a
+  workload; `TokenInfo.Scopes` are the granted service scopes;
+  `mcpauth.Principal(req)` reads the `Principal` per call. Tested end to
+  end with the SDK's own client: DCR sign-in, client credentials, and one
+  endpoint taking both paths.
 - **`authserver`: steward's OAuth 2.1 authorization server** (Path B,
   k8s-lookout#702). A service mounts it at an issuer URL in front of
   Google sign-in, so MCP clients that discover and register with an

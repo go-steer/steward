@@ -43,6 +43,18 @@
 // request, so the raw token is not in req.Extra.Header for a handler (or
 // anything that logs headers) to pick up.
 //
+// # Both paths
+//
+// Behind a Protector with an authserver.Server, a request may carry
+// steward's own token (Path B). A person reaches a tool exactly as on Path
+// A: TokenSource and Identity, and a session UserID that is their Google
+// sub on either path. A workload (client credentials) has no person: its
+// UserID is "client:<id>", TokenSource and Identity report false, and
+// Principal(req) gives the authserver.Principal, whose own TokenSource is
+// its service account's token if it has one. For a Path B token,
+// TokenInfo.Scopes are the granted service scopes; for Path A, the Google
+// scopes.
+//
 // It is the only steward package that imports the MCP SDK.
 package mcpauth
 
@@ -54,6 +66,7 @@ import (
 	"github.com/modelcontextprotocol/go-sdk/mcp"
 	"golang.org/x/oauth2"
 
+	"github.com/go-steer/steward/authserver"
 	"github.com/go-steer/steward/googletoken"
 	"github.com/go-steer/steward/httpauth"
 )
@@ -67,6 +80,7 @@ const (
 
 	extraTokenSource = "steward.token-source"
 	extraIdentity    = "steward.identity"
+	extraPrincipal   = "steward.principal"
 )
 
 // Middleware protects an MCP endpoint with p, binds each session to its
@@ -106,16 +120,33 @@ func fromProtector(_ context.Context, _ string, r *http.Request) (*auth.TokenInf
 }
 
 // TokenInfo builds the SDK TokenInfo for a request that passed a
-// Protector. UserID is Google's stable account ID (sub), falling back to
-// the email if Google sent none, so that it is never empty: an empty
-// UserID would turn the SDK's session binding off.
+// Protector. For a person, UserID is Google's stable account ID (sub) on
+// either path, falling back to the email if Google sent none, so that it
+// is never empty: an empty UserID would turn the SDK's session binding
+// off. For a workload it is authserver.WorkloadSubject of its client.
 func TokenInfo(ctx context.Context) (*auth.TokenInfo, bool) {
-	id, ok := httpauth.IdentityFromContext(ctx)
-	if !ok {
+	p, isPrincipal := httpauth.PrincipalFromContext(ctx)
+	id, isPerson := httpauth.IdentityFromContext(ctx)
+	var ti *auth.TokenInfo
+	switch {
+	case isPrincipal:
+		// authserver.Verify refuses a token with no subject, so UserID is
+		// never empty here either.
+		ti = &auth.TokenInfo{
+			UserID:     p.Subject,
+			Scopes:     p.Scopes,
+			Expiration: p.Expiry,
+			Extra:      map[string]any{ExtraEmail: p.Email, ExtraHD: p.HD, extraPrincipal: p},
+		}
+		if isPerson {
+			ti.Extra[extraIdentity] = id
+		}
+	case isPerson:
+		ti = tokenInfoFor(id)
+	default:
 		return nil, false
 	}
-	ti := tokenInfoFor(id)
-	if ts, ok := httpauth.TokenSourceFromContext(ctx); ok {
+	if ts, ok := httpauth.TokenSourceFromContext(ctx); ok && isPerson {
 		ti.Extra[extraTokenSource] = ts
 	}
 	return ti, true
@@ -138,7 +169,7 @@ func tokenInfoFor(id googletoken.Identity) *auth.TokenInfo {
 // that came with the HTTP request carrying it, not the one the session
 // started with. Use it in tool handlers instead of
 // httpauth.TokenSourceFromContext. ok is false for a request that did not
-// come through Middleware.
+// come through Middleware, and for a workload (see Principal).
 func TokenSource(req mcp.Request) (oauth2.TokenSource, bool) {
 	ti := tokenInfoOf(req)
 	if ti == nil {
@@ -148,8 +179,22 @@ func TokenSource(req mcp.Request) (oauth2.TokenSource, bool) {
 	return ts, ok
 }
 
-// Identity returns the caller's verified identity for this call. ok is
-// false for a request that did not come through Middleware.
+// Principal returns the authserver.Principal for this call, when it came
+// with a steward access token (Path B): a person or a workload. ok is false
+// for a Google token (Path A) and for a request that did not come through
+// Middleware.
+func Principal(req mcp.Request) (authserver.Principal, bool) {
+	ti := tokenInfoOf(req)
+	if ti == nil {
+		return authserver.Principal{}, false
+	}
+	p, ok := ti.Extra[extraPrincipal].(authserver.Principal)
+	return p, ok
+}
+
+// Identity returns the verified identity of the person behind this call,
+// on either path. ok is false for a workload and for a request that did
+// not come through Middleware.
 func Identity(req mcp.Request) (googletoken.Identity, bool) {
 	ti := tokenInfoOf(req)
 	if ti == nil {

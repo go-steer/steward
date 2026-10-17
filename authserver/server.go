@@ -36,8 +36,10 @@
 // refresh-token families; the default is in memory, per replica.
 //
 // The protected resource verifies access tokens with Server.Verify, or
-// with the purser authenticator from Server.Authenticator. Nothing here
-// imports the MCP SDK.
+// with the purser authenticator from Server.Authenticator; an
+// httpauth.Protector with Options.AuthServer does that, beside Google's own
+// tokens (Path A), and hands the handler the person's Google token. Nothing
+// here imports the MCP SDK.
 //
 // Taken from gke-demos/kode-gopher internal/oauth at
 // 8b53617b7d4d0b08b158de64ab7416dc84a1281e (docs/design-in-cluster.md
@@ -371,6 +373,10 @@ func (s *Server) Resource() string { return s.cfg.Resource }
 
 // Scopes are the service's scopes, as configured.
 func (s *Server) Scopes() []string { return slices.Clone(s.scopes) }
+
+// DefaultScopes are the scopes granted to a client that asks for none of
+// Scopes: Config.DefaultScopes, or all of Scopes.
+func (s *Server) DefaultScopes() []string { return slices.Clone(s.defaultScopes) }
 
 // CallbackURL is where Google returns the browser after sign-in. Register
 // it as a redirect URI of the Google OAuth client.

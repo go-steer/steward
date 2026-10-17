@@ -25,7 +25,7 @@ one caller type however the caller arrived.
 
 | Consumer | Uses | Status |
 |---|---|---|
-| go-steer/k8s-lookout | Path A: Gemini Enterprise users read clusters as themselves (k8s-lookout#699) | planned, on v0.1.0 |
+| go-steer/k8s-lookout | Path A: Gemini Enterprise users read clusters as themselves (k8s-lookout#699); Path B: generic MCP clients sign in through steward's authorization server (k8s-lookout#702) | Path A on v0.1.0; Path B on v0.2.0 |
 | go-steer/supercargo | Path A: the source of `googletoken`; adopting steward would replace its `internal/googleauth` | deferred (2026-10-15): supercargo stays as it is for now; port fixes by hand |
 
 ## Path A — the client holds the user's token
@@ -203,7 +203,7 @@ dependency) or `cloud.google.com/go/auth/credentials/idtoken` (what
 supercargo uses today, a much larger dependency tree) is decided in that
 package's PR; purser's verifier is preferred if it can check the nonce.
 
-## Path B — later: the service is its own authorization server
+## Path B — the service is its own authorization server
 
 Generic MCP clients (Claude Code, gemini-cli, IDEs) expect to discover an
 authorization server and register with it by DCR or CIMD, which Google's
@@ -413,7 +413,65 @@ possible; client secrets are compared by digest; a static client's
 redirect URIs are validated at load and its slices copied; Google's
 endpoints must be https; the keys being unavailable is `server_error`,
 never `invalid_grant`; and the consent page's text is the service's
-(`ServiceName`).
+(`ServiceName`). Scopes are granted in the configuration's order, so a
+grant reads the same however the client ordered its request.
+
+### Both paths on one resource (`httpauth`, `mcpauth`)
+
+`httpauth.Options` gains `AuthServer` (and `Authenticator` becomes
+optional: at least one of them). The Protector then:
+
+- **Routes by shape, verifies fully.** A bearer token with the `st1.`
+  prefix goes to a second purser `CallerMiddleware` around
+  `Server.Authenticator()`, also with `Enforce` and no `Fallback`; anything
+  else goes to the Google one. Routing decides only which verifier looks;
+  each refuses what it does not recognize. Without an `Authenticator`,
+  everything goes to the steward verifier; without an `AuthServer`, a
+  steward token is refused locally and never sent to Google's tokeninfo.
+- **Gives a person the same shape on both paths.** Behind it, a steward
+  token from a person puts the Google token sealed inside on
+  `TokenSourceFromContext` and a `googletoken.Identity` (sub, email, hd,
+  the Google token's scopes and expiry) on `IdentityFromContext`, as Path A
+  does, plus the `authserver.Principal` on `PrincipalFromContext`. A
+  workload gets only the `Principal`: no person, no person's token, so a
+  service cannot mistake it for one (`TokenSourceFromContext` reports
+  false), even when its service account's token rides in its access token
+  (that is `Principal.TokenSource()`). A person's token without a Google
+  token inside is refused rather than passed as if it were a workload.
+- **Names steward's issuer** in the RFC 9728 metadata (only it: a generic
+  client picks the first server listed, and Google's cannot register it),
+  advertising the server's service scopes, with CORS for browser-based
+  clients. The 401 challenge names the server's `DefaultScopes`: MCP
+  clients request what the challenge names, so a service that sets
+  `DefaultScopes` to its read scope gets least-privilege tokens from
+  generic clients. Explicit `Scopes` must be the server's.
+- **Two allow-lists.** Path A admits through the `Authenticator`'s
+  `Admitter`, Path B through `authserver.Config.Admit` (at sign-in and
+  every refresh). Give them the same entries.
+- **Enforces `RequiredScopes`** on steward tokens: one without them is a
+  403 with `error="insufficient_scope"`, which starts a client's step-up.
+  Google tokens carry no service scopes and are not held to them; on Path
+  A the service's own rules decide.
+- **Answers 503** if the keys vanish between the two layers, as for a
+  Google outage on Path A. (Before that, purser's middleware maps every
+  authentication error, an unavailable key store included, to 401.)
+
+`mcpauth.TokenInfo` builds the SDK `TokenInfo` from the `Principal` for a
+steward token: `UserID` is the Google `sub` for a person, the same as on
+Path A, so one person's session continues across the two paths, and
+`client:<id>` for a workload, which therefore cannot use a person's
+session. Binding is per person, not per client: the same person keeps a
+session across paths and clients. `Scopes` are the granted service scopes (on Path A, the Google
+scopes), and `Expiration` is the access token's. `mcpauth.Principal(req)`
+reads the `Principal` in a tool handler, per call like `TokenSource`.
+
+Verified end to end with the MCP SDK's own client (v1.8.0): discovery
+from the resource's metadata, DCR, consent, Google sign-in and a tool call
+as the person; the client-credentials handler as a workload; and one
+endpoint taking both paths. That run found one interoperability bug, now
+fixed: the SDK's client asks for every advertised scope, which the
+client-credentials grant first refused instead of dropping the ones the
+client may not have.
 
 ## Hard rules
 
@@ -453,10 +511,13 @@ Minimal, per go-steer policy:
 
 - `github.com/go-steer/purser` — the caller contract.
 - `golang.org/x/oauth2` — token sources and the sign-in exchange.
-- `github.com/modelcontextprotocol/go-sdk` — only in `mcpauth`, pinned to
-  the version k8s-lookout uses (v1.8.0). Its `auth` package brings
-  `segmentio/encoding` and `segmentio/asm`; they are compiled only into a
-  service that imports `mcpauth`.
+- `github.com/modelcontextprotocol/go-sdk` — only in `mcpauth` (and the
+  test helper `internal/pathbtest`), pinned to the version k8s-lookout
+  uses (v1.8.0). Its `auth` package brings `segmentio/encoding` and
+  `segmentio/asm`; they are compiled only into a service that imports
+  `mcpauth`. `authserver`, `seal` and `httpauth` do not import it.
+- No Google Cloud SDK anywhere: the vault, Cloud Identity and Secret
+  Manager are called over REST with a caller-supplied `*http.Client`.
 
 ## Testing
 
@@ -477,5 +538,5 @@ limit). Ported tests keep their supercargo coverage.
 | 2a | Path A verification: `googletoken`, `allow` (emails, domains) | done: steward#3 |
 | 2b | Path A wiring: `httpauth`, `mcpauth`; tag v0.1.0 | done: steward#4, v0.1.0 |
 | 3 | k8s-lookout adopts v0.1.0 (supercargo deferred) | k8s-lookout#699 |
-| 4 | `signin`; `allow` groups | steward#1 |
-| 5 | Path B | k8s-lookout#702 |
+| 4 | `allow` groups; `signin` | groups: done (steward#6); `signin`: steward#1 |
+| 5 | Path B: `seal`, `authserver`, both paths in `httpauth` and `mcpauth`; tag v0.2.0 | done: steward#6, #7, #8, #9, v0.2.0 (k8s-lookout#702) |
