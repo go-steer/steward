@@ -8,6 +8,27 @@ exported API" in [`CONTRIBUTING.md`](./CONTRIBUTING.md)).
 
 ## [Unreleased]
 
+*Nothing yet.*
+
+## [0.2.0] - 2026-10-17
+
+Path B: a go-steer service can be its own OAuth 2.1 authorization server
+in front of Google sign-in, so generic MCP clients (Claude Code,
+gemini-cli, IDEs), which discover an authorization server and register
+with it, can sign people in, and the service acts as each person with
+their own Google token, exactly as it does for Path A's Gemini Enterprise
+callers.
+
+**What v0.2.0 is for.** k8s-lookout#702: lookout mounts `authserver`,
+and one `httpauth.Protector` takes both Gemini Enterprise's Google tokens
+and steward's own, yielding the same `purser.Caller` and token source.
+The authorization server, its token sealing and the group allow-list are
+taken from kode-gopher `internal/oauth` at
+`8b53617b7d4d0b08b158de64ab7416dc84a1281e`, which will not import steward;
+the fixes made here in review are listed in DESIGN.md for porting back.
+The exported API changed additively only; two behaviour changes are under
+*Changed*.
+
 ### Added
 
 - **`httpauth`: one Protector for both paths.** `Options.AuthServer`
@@ -182,5 +203,6 @@ come later.
   adversarial-review gate and agent-attribution check follow purser and
   supercargo. No exported API yet.
 
-[Unreleased]: https://github.com/go-steer/steward/compare/v0.1.0...HEAD
+[Unreleased]: https://github.com/go-steer/steward/compare/v0.2.0...HEAD
+[0.2.0]: https://github.com/go-steer/steward/releases/tag/v0.2.0
 [0.1.0]: https://github.com/go-steer/steward/releases/tag/v0.1.0
