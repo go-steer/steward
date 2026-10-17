@@ -353,14 +353,21 @@ the family its sign-in started, with a generation number; a refresh moves
 the family to the next generation. Presenting a generation the family has
 moved past is a replay, so the whole family is revoked and the user signs
 in again. Storage grows with live families (one per sign-in per client),
-not with refreshes. The default is in memory: across replicas or a
-restart, a rotated token can be used once more where its family is not
-known (a later generation, which only another replica can have minted,
-moves the family on rather than revoking it; PKCE still binds a code to
-its client's verifier). A service that runs replicas supplies a shared
-`ReplayCache`. A cache that cannot answer is `server_error`, never a pass.
-There is no grace period: a client that loses a refresh response and
-retries with the old token signs in again.
+not with refreshes. The default is in memory, and with one cache per
+replica reuse detection is per replica: a stolen refresh token can go on
+being used on a replica that never saw its family revoked, and a code can
+be exchanged once on each (PKCE still binds it to its client's verifier).
+A later generation than a replica knows moves the family on rather than
+revoking it, since only another replica can have minted it. A service that
+runs replicas supplies a shared `ReplayCache`; its doc states what one
+must guarantee (atomic per family, no eviction before expiry, revocation
+until expiry, an error means not applied). A cache that cannot answer is
+`server_error`, never a pass. Giving a claim or a rotation back after a
+transient failure runs detached from the request's context, so a client
+that went away mid-refresh can retry; a `Rotate` error is followed by a
+conditional `Unrotate` in case it was applied. There is no grace period: a
+client that loses a refresh response and retries with the old token signs
+in again.
 
 **Client credentials.** A pre-registered confidential client with
 `ClientCredentials` (or a `ServiceAccount`, which implies it) gets an

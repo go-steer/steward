@@ -218,12 +218,28 @@ func (s *Server) exchangeCode(r *http.Request, c *client) (map[string]any, *toke
 		return nil, invalidGrant("authorization code already used")
 	}
 	g := &grant{AccessToken: p.Token, Expiry: time.Unix(p.TokenExp, 0), Scopes: strings.Fields(p.GoogleScope), Secret: p.Secret}
-	resp, terr := s.issueTokens(ctx, p.User, c.ID, p.Req.Resource, p.Req.Scope, p.Req.Scope, rand.Text(), 0, g)
+	resp, terr := s.issueTokens(ctx, p.User, c.ID, p.Req.Resource, p.Req.Scope, p.Req.Scope, rand.Text(), 0, s.now().Add(RefreshTTL), g)
 	if terr != nil {
 		// Nothing was handed out: let the client try the code again.
-		_ = s.used.Release(ctx, "code:"+p.JTI)
+		s.undo(ctx, "release the authorization code", func(ctx context.Context) error { return s.used.Release(ctx, "code:"+p.JTI) })
 	}
 	return resp, terr
+}
+
+// undoTimeout bounds giving a claim or a rotation back.
+const undoTimeout = 5 * time.Second
+
+// undo gives back a replay-cache claim or rotation after a transient
+// failure. It runs detached from the request's context: a client that went
+// away mid-refresh must not leave its family rotated, or its retry would be
+// taken for a replay and revoke the family. A failure is logged; the
+// client's retry then needs a new sign-in.
+func (s *Server) undo(ctx context.Context, what string, f func(context.Context) error) {
+	uctx, cancel := context.WithTimeout(context.WithoutCancel(ctx), undoTimeout)
+	defer cancel()
+	if err := f(uctx); err != nil {
+		s.log.WarnContext(ctx, "authserver: could not "+what, "err", err)
+	}
 }
 
 // verifierRE is RFC 7636 section 4.1: 43 to 128 unreserved characters.
@@ -284,9 +300,18 @@ func (s *Server) refreshTokens(ctx context.Context, r *http.Request, c *client) 
 	if p.Family == "" {
 		return nil, invalidGrant("invalid refresh token")
 	}
-	fresh, err := s.used.Rotate(ctx, p.Family, p.Gen, s.now().Add(RefreshTTL))
+	// One expiry for the family and the token that will carry it, so the
+	// family is never forgotten before its newest token expires.
+	exp := s.now().Add(RefreshTTL)
+	release := func() {
+		s.undo(ctx, "give back a refresh rotation", func(ctx context.Context) error { return s.used.Unrotate(ctx, p.Family, p.Gen) })
+	}
+	fresh, err := s.used.Rotate(ctx, p.Family, p.Gen, exp)
 	if err != nil {
 		s.log.ErrorContext(ctx, "authserver: replay cache", "err", err)
+		// The rotation may have been applied before the error (a
+		// timeout after a write): Unrotate is conditional, so undo it.
+		release()
 		return nil, serverError("couldn't record the refresh token's use")
 	}
 	if !fresh {
@@ -298,7 +323,6 @@ func (s *Server) refreshTokens(ctx context.Context, r *http.Request, c *client) 
 	// back, or the client's retry would be refused as a replay and its user
 	// signed out; a final refusal (invalid_grant: not allowed, or a grant
 	// only the user can restore, errReauth) keeps it spent.
-	release := func() { _ = s.used.Unrotate(ctx, p.Family, p.Gen) }
 	if err := s.cfg.Admit.Admit(ctx, p.User.Email, p.User.Domain); err != nil {
 		if errors.Is(err, allow.ErrNotAdmitted) {
 			s.log.InfoContext(ctx, "authserver: refresh refused by the allow-list", "email", p.User.Email)
@@ -318,7 +342,7 @@ func (s *Server) refreshTokens(ctx context.Context, r *http.Request, c *client) 
 		release()
 		return nil, serverError("couldn't refresh the Google grant")
 	}
-	resp, terr := s.issueTokens(ctx, p.User, c.ID, p.Aud, scope, grantScope, p.Family, p.Gen+1, g)
+	resp, terr := s.issueTokens(ctx, p.User, c.ID, p.Aud, scope, grantScope, p.Family, p.Gen+1, exp, g)
 	if terr != nil {
 		release()
 	}
@@ -341,9 +365,9 @@ func narrowScope(requested, granted []string) (string, *tokenError) {
 
 // issueTokens seals a new access and refresh token pair: the access token
 // with scope, the refresh token with grantScope (the same, unless a refresh
-// narrowed the access token) at generation gen of family. The access token
-// never outlives the Google token inside it.
-func (s *Server) issueTokens(ctx context.Context, u User, clientID, aud, scope, grantScope, family string, gen uint64, g *grant) (map[string]any, *tokenError) {
+// narrowed the access token) at generation gen of family, expiring at
+// refreshExp. The access token never outlives the Google token inside it.
+func (s *Server) issueTokens(ctx context.Context, u User, clientID, aud, scope, grantScope, family string, gen uint64, refreshExp time.Time, g *grant) (map[string]any, *tokenError) {
 	now := s.now()
 	at, exp, terr := s.sealAccess(ctx, accessPayload{
 		Sub: u.Sub, Email: u.Email, HD: u.Domain, ClientID: clientID, Aud: aud, Scope: scope,
@@ -354,7 +378,7 @@ func (s *Server) issueTokens(ctx context.Context, u User, clientID, aud, scope, 
 	}
 	rt, err := s.seal(ctx, purposeRefresh, refreshPayload{
 		User: u, ClientID: clientID, Aud: aud, Scope: grantScope, Secret: g.Secret,
-		Family: family, Gen: gen, Exp: now.Add(RefreshTTL).Unix(),
+		Family: family, Gen: gen, Exp: refreshExp.Unix(),
 	})
 	if err != nil {
 		s.log.ErrorContext(ctx, "authserver: seal refresh token", "err", err)

@@ -16,6 +16,8 @@ package authserver
 
 import (
 	"context"
+	"crypto/tls"
+	"crypto/x509"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -268,6 +270,9 @@ func (f *cimdFetcher) fetch(ctx context.Context, id string) (*client, error) {
 	req.Header.Set("Accept", "application/json")
 	resp, err := f.hc.Do(req) //nolint:gosec // G704: a client-supplied URL, fetched with SSRFSafeClient
 	if err != nil {
+		if permanentFetchError(err) {
+			return nil, fmt.Errorf("fetch client metadata: %w", err)
+		}
 		return nil, fmt.Errorf("%w: %w", errCIMDUnavailable, err)
 	}
 	defer func() { _ = resp.Body.Close() }()
@@ -326,6 +331,21 @@ func (f *cimdFetcher) fetch(ctx context.Context, id string) (*client, error) {
 	return c, nil
 }
 
+// permanentFetchError reports whether a metadata fetch failed for a
+// reason a retry will not fix: an address SSRFSafeClient refuses, a name
+// that does not resolve, or a certificate that does not verify. Those make
+// the client unknown; anything else (timeouts, refused or reset
+// connections) is its host being unavailable.
+func permanentFetchError(err error) bool {
+	var dns *net.DNSError
+	var cert *tls.CertificateVerificationError
+	var unknownCA x509.UnknownAuthorityError
+	var hostname x509.HostnameError
+	var invalid x509.CertificateInvalidError
+	return errors.Is(err, errNonPublic) || (errors.As(err, &dns) && dns.IsNotFound) ||
+		errors.As(err, &cert) || errors.As(err, &unknownCA) || errors.As(err, &hostname) || errors.As(err, &invalid)
+}
+
 // maxClientName bounds a client name shown on the consent page and logged.
 const maxClientName = 100
 
@@ -372,7 +392,7 @@ func SSRFSafeClient(timeout time.Duration) *http.Client {
 			}
 			ip, err := netip.ParseAddr(host)
 			if err != nil || !isPublic(ip) {
-				return fmt.Errorf("refusing to dial non-public address %s", host)
+				return fmt.Errorf("%w %s", errNonPublic, host)
 			}
 			return nil
 		},
@@ -390,20 +410,28 @@ func SSRFSafeClient(timeout time.Duration) *http.Client {
 	}
 }
 
+// errNonPublic is SSRFSafeClient refusing an address.
+var errNonPublic = errors.New("refusing to dial non-public address")
+
 // nonPublic are special-purpose ranges that IsGlobalUnicast admits but a
-// client-supplied URL must not reach: shared address space, IETF protocol
-// assignments, benchmarking, the 6to4 relay anycast, reserved space, and
-// the IPv6 translation and tunnelling prefixes, which embed an IPv4 address
-// (NAT64 64:ff9b::/96 reaches 169.254.169.254 as 64:ff9b::a9fe:a9fe).
+// client-supplied URL must not reach: "this network", shared address
+// space, IETF protocol assignments, benchmarking, the 6to4 relay anycast,
+// reserved space, documentation, and the IPv6 prefixes that embed an IPv4
+// address (IPv4-compatible, SIIT, NAT64, Teredo and the rest of the IETF
+// block, 6to4): NAT64's 64:ff9b::a9fe:a9fe reaches 169.254.169.254.
 var nonPublic = []netip.Prefix{
+	netip.MustParsePrefix("0.0.0.0/8"),
 	netip.MustParsePrefix("100.64.0.0/10"),
 	netip.MustParsePrefix("192.0.0.0/24"),
 	netip.MustParsePrefix("192.88.99.0/24"),
 	netip.MustParsePrefix("198.18.0.0/15"),
 	netip.MustParsePrefix("240.0.0.0/4"),
+	netip.MustParsePrefix("::/96"),
+	netip.MustParsePrefix("::ffff:0:0:0/96"),
 	netip.MustParsePrefix("64:ff9b::/96"),
 	netip.MustParsePrefix("64:ff9b:1::/48"),
-	netip.MustParsePrefix("2001::/32"),
+	netip.MustParsePrefix("2001::/23"),
+	netip.MustParsePrefix("2001:db8::/32"),
 	netip.MustParsePrefix("2002::/16"),
 }
 

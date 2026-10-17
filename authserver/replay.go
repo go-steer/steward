@@ -34,9 +34,19 @@ import (
 // again. Storage grows with live families (one per sign-in per client),
 // not with refreshes.
 //
-// Implementations must be safe for concurrent use, and atomic per ID and
-// per family. An error is a cache that could not answer; the token
-// endpoint then answers server_error and spends nothing.
+// A shared implementation (for a service running several replicas) must:
+//
+//   - be safe for concurrent use, and atomic per ID and per family (a
+//     compare-and-set, a transaction or a script);
+//   - keep every claim and every family until its exp, never evicting one
+//     early: a forgotten family accepts any generation, which turns reuse
+//     detection off, and a forgotten claim lets a code be used twice;
+//   - keep a revocation until the family's exp;
+//   - make an error mean "not applied", as far as it can tell; the server
+//     follows a Rotate error with an Unrotate in case it was applied anyway.
+//
+// An error is a cache that could not answer; the token endpoint then
+// answers server_error and spends nothing.
 type ReplayCache interface {
 	// Claim spends a single-use ID until exp. It reports false if the ID
 	// was already spent (and that claim has not expired).
@@ -44,15 +54,16 @@ type ReplayCache interface {
 	// Release gives back a claim, after a use that failed for a transient
 	// reason, so the client's retry is not refused as a replay.
 	Release(ctx context.Context, id string) error
-	// Rotate moves family from generation gen to gen+1, remembered until
-	// exp. It reports false, and revokes the family, if the family is past
-	// gen; false also for a revoked family. An unknown (or expired) family,
-	// or one at an earlier generation (another replica rotated it), is
-	// moved to gen+1.
+	// Rotate moves family from generation gen to gen+1 and sets its exp.
+	// It reports false, and revokes the family until its current exp, if
+	// the family is past gen; false also for a revoked family. An unknown
+	// (or expired) family is created at gen+1. A family at an earlier
+	// generation is moved to gen+1: with a cache that loses state (one per
+	// replica, or one that restarts), another replica may have rotated it.
 	Rotate(ctx context.Context, family string, gen uint64, exp time.Time) (bool, error)
-	// Unrotate moves family back from gen+1 to gen, after a refresh that
-	// failed for a transient reason. It does nothing if the family has
-	// moved on or been revoked.
+	// Unrotate moves family back from gen+1 to gen, leaving its exp, after
+	// a refresh that failed for a transient reason. It does nothing for a
+	// family that has moved on, been revoked, expired or is unknown.
 	Unrotate(ctx context.Context, family string, gen uint64) error
 }
 
@@ -64,15 +75,23 @@ type ReplayCache interface {
 const maxMemoryEntries = 1 << 20
 
 // MemoryReplayCache is the in-memory ReplayCache: per process, and
-// forgotten on restart. With several replicas, or across a restart, a
-// rotated refresh token could be used once more where the family is not
-// known; a service running replicas supplies a shared ReplayCache.
+// forgotten on restart. With several replicas each keeping its own, reuse
+// detection is per replica: a stolen refresh token can go on being used on
+// a replica that never saw the family revoked, and a code can be exchanged
+// once on each (PKCE still binds it to its client's verifier). A service
+// running replicas supplies a shared ReplayCache.
 type MemoryReplayCache struct {
 	mu       sync.Mutex
 	codes    map[string]time.Time
 	families map[string]family
 	now      func() time.Time
+
+	codesSwept, familiesSwept time.Time
 }
+
+// sweepEvery limits how often a full table is swept for expired entries,
+// so a table full of live entries does not cost a full walk per request.
+const sweepEvery = 10 * time.Second
 
 type family struct {
 	gen     uint64
@@ -100,9 +119,12 @@ func (c *MemoryReplayCache) Claim(_ context.Context, id string, exp time.Time) (
 		return false, nil
 	}
 	if len(c.codes) >= maxMemoryEntries {
-		for k, e := range c.codes {
-			if !now.Before(e) {
-				delete(c.codes, k)
+		if now.Sub(c.codesSwept) >= sweepEvery {
+			c.codesSwept = now
+			for k, e := range c.codes {
+				if !now.Before(e) {
+					delete(c.codes, k)
+				}
 			}
 		}
 		if len(c.codes) >= maxMemoryEntries {
@@ -136,15 +158,19 @@ func (c *MemoryReplayCache) Rotate(_ context.Context, fam string, gen uint64, ex
 			c.families[fam] = f
 			return false, nil
 		}
-		// gen == f.gen, or a later generation another replica rotated to
-		// (tokens are sealed, so no one else can mint one): move on.
+		// gen == f.gen, or a later generation: only another replica (or
+		// this one before a restart) can have minted it, since tokens are
+		// sealed, so move on.
 		c.families[fam] = family{gen: gen + 1, exp: exp}
 		return true, nil
 	}
 	if len(c.families) >= maxMemoryEntries {
-		for k, f := range c.families {
-			if !now.Before(f.exp) {
-				delete(c.families, k)
+		if now.Sub(c.familiesSwept) >= sweepEvery {
+			c.familiesSwept = now
+			for k, f := range c.families {
+				if !now.Before(f.exp) {
+					delete(c.families, k)
+				}
 			}
 		}
 		if len(c.families) >= maxMemoryEntries {

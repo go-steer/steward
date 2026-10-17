@@ -657,7 +657,7 @@ func TestVerify(t *testing.T) {
 		return s
 	}
 	now := time.Now()
-	good := accessPayload{Sub: "1", Email: "a@example.com", HD: "example.com", ClientID: "c", Aud: e.as.Resource(), Scope: scopeRead,
+	good := accessPayload{Sub: "1", Email: "a@example.com", HD: "example.com", ClientID: "https://client.example/c.json", Aud: e.as.Resource(), Scope: scopeRead,
 		Token: "ya29.x", TokenExp: now.Add(time.Hour).Unix(), GoogleScope: ScopeCloudPlatform, Exp: now.Add(time.Minute).Unix()}
 	expired, otherAud, noSub, noEmail, noToken, oddMode := good, good, good, good, good, good
 	expired.Exp = now.Add(-time.Minute).Unix()
@@ -673,7 +673,7 @@ func TestVerify(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if p.Subject != "1" || p.Email != "a@example.com" || p.HD != "example.com" || p.ClientID != "c" || !p.HasScope(scopeRead) || p.HasScope(scopeWrite) || p.Workload || len(p.GoogleScopes) != 1 {
+	if p.Subject != "1" || p.Email != "a@example.com" || p.HD != "example.com" || p.ClientID != "https://client.example/c.json" || !p.HasScope(scopeRead) || p.HasScope(scopeWrite) || p.Workload || len(p.GoogleScopes) != 1 {
 		t.Errorf("Principal = %+v", p)
 	}
 	ts, ok := p.TokenSource()
@@ -681,7 +681,7 @@ func TestVerify(t *testing.T) {
 		t.Errorf("TokenSource = %v, %v", tok, ok)
 	}
 	c := p.Caller()
-	if c.Identity != "a@example.com" || c.Label(LabelSubject) != "1" || c.Label(LabelHD) != "example.com" || c.Label(LabelKind) != KindUser || c.Label(LabelScope) != scopeRead || c.Label(LabelClientID) != "c" {
+	if c.Identity != "a@example.com" || c.Label(LabelSubject) != "1" || c.Label(LabelHD) != "example.com" || c.Label(LabelKind) != KindUser || c.Label(LabelScope) != scopeRead || c.Label(LabelClientID) != "https://client.example/c.json" {
 		t.Errorf("Caller = %+v", c)
 	}
 	for name, tok := range map[string]string{

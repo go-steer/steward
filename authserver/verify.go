@@ -163,16 +163,24 @@ func (s *Server) Verify(ctx context.Context, token string) (Principal, error) {
 		return Principal{}, ErrInvalidToken
 	}
 	// A person's token keeps only the scopes the configuration still allows
-	// its client (a workload's was refused above if it has any other).
+	// its client (a workload's was refused above if it has any other). A
+	// pre-registered client that has been removed has none.
 	allowed := s.scopes
 	if c, ok := s.static[p.ClientID]; ok {
 		allowed = s.allowedScopes(&client{static: &c})
+	} else if !seal.IsSealed(p.ClientID) && !strings.HasPrefix(p.ClientID, "https://") {
+		return Principal{}, ErrInvalidToken
 	}
 	var scopes []string
 	for _, sc := range strings.Fields(p.Scope) {
 		if slices.Contains(allowed, sc) {
 			scopes = append(scopes, sc)
 		}
+	}
+	if len(scopes) == 0 {
+		// Nothing it was granted is still allowed: refused, as a refresh
+		// would be, rather than passed with no scope at all.
+		return Principal{}, ErrInvalidToken
 	}
 	pr := Principal{
 		Subject:        p.Sub,

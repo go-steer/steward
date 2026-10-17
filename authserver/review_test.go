@@ -292,7 +292,7 @@ func TestIdentityChangeAtRefresh(t *testing.T) {
 	}
 
 	idTok := func(email string) string {
-		b, _ := json.Marshal(map[string]any{"iss": "https://accounts.google.com", "aud": testGoogleID, "sub": "111", "email": email, "email_verified": true, "exp": 4102444800})
+		b, _ := json.Marshal(map[string]any{"iss": "https://accounts.google.com", "aud": testGoogleID, "sub": "111", "email": email, "hd": "example.com", "email_verified": true, "exp": 4102444800})
 		return "e30." + base64.RawURLEncoding.EncodeToString(b) + ".sig"
 	}
 	for email, wantReauth := range map[string]bool{"alice.new@example.com": true, "alice@example.com": false} {
@@ -416,7 +416,7 @@ func TestIssuerBoundIntoSeals(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	tok, err := other.seal(context.Background(), purposeAccess, accessPayload{Sub: "1", Email: "a@example.com", ClientID: "c", Aud: e.as.Resource(),
+	tok, err := other.seal(context.Background(), purposeAccess, accessPayload{Sub: "1", Email: "a@example.com", ClientID: "https://client.example/c.json", Aud: e.as.Resource(),
 		Scope: scopeRead, Token: "ya29.x", TokenExp: 4102444800, Exp: 4102444800})
 	if err != nil {
 		t.Fatal(err)

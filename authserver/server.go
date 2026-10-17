@@ -313,7 +313,7 @@ func New(cfg Config) (*Server, error) {
 	return s, nil
 }
 
-var authProviderRE = regexp.MustCompile(`^projects/[A-Za-z0-9_-]+/locations/[a-z0-9-]+/authProviders/[A-Za-z0-9_-]+$`)
+var authProviderRE = regexp.MustCompile(`^projects/[A-Za-z0-9.:_-]+/locations/[a-z0-9-]+/authProviders/[A-Za-z0-9_-]+$`)
 
 // checkURL requires an absolute https URL (http only for a loopback host)
 // with no query, fragment or userinfo.

@@ -161,9 +161,11 @@ func (s *Server) validateAuthRequest(q url.Values, c *client, redirectURI string
 // allows; if that leaves none, the default scopes the client may have. ok
 // is false if the client may have none of those either.
 func (s *Server) grantScopes(requested, allowed []string) (string, bool) {
+	// In the configuration's order, whatever order the client asked in, so
+	// a grant reads the same however it was requested.
 	var granted []string
-	for _, sc := range requested {
-		if slices.Contains(allowed, sc) && !slices.Contains(granted, sc) {
+	for _, sc := range s.scopes {
+		if slices.Contains(requested, sc) && slices.Contains(allowed, sc) {
 			granted = append(granted, sc)
 		}
 	}

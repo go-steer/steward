@@ -131,7 +131,7 @@ func (SealedCustody) refresh(ctx context.Context, g *upstream, u User, secret, _
 	// has changed since sign-in, the identity (and admission) sealed in the
 	// refresh token is stale: sign in again.
 	if t.IDToken != "" {
-		if now, err := g.client.verifyIDToken(t.IDToken, time.Now()); err == nil && (now.Sub != u.Sub || now.Email != u.Email) {
+		if now, err := g.client.verifyIDToken(t.IDToken, time.Now()); err == nil && (now.Sub != u.Sub || now.Email != u.Email || now.Domain != u.Domain) {
 			return nil, reauthError("the Google account's identity changed since sign-in")
 		}
 	}
@@ -253,7 +253,8 @@ func (v *VaultCustody) grant(ctx context.Context, g *upstream, u User, r *vaultR
 		}
 		if ti.Email != "" && !strings.EqualFold(ti.Email, u.Email) {
 			// Same account, new address: the identity (and admission)
-			// sealed at sign-in is stale.
+			// sealed at sign-in is stale. tokeninfo reports the email
+			// because the vault is always asked for userinfo.email.
 			return nil, reauthError("vault: the Google account's email changed since sign-in")
 		}
 		if time.Until(ti.Expiry) >= minGoogleTokenLife {
