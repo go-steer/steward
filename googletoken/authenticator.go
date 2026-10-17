@@ -60,7 +60,7 @@ var ErrNotAdmitted = fmt.Errorf("%w: account not admitted", ErrInvalid)
 // an outage is visible.
 type Authenticator struct {
 	v     *Verifier
-	allow *allow.List
+	admit *allow.Admitter
 }
 
 var (
@@ -71,6 +71,8 @@ var (
 // NewAuthenticator builds an Authenticator. Both arguments are required;
 // an empty allow-list admits no one, and is refused here because a
 // surface that can admit no one is a configuration mistake, not a policy.
+// A list with group entries needs a directory to look them up, and is
+// refused here too: use NewAdmittingAuthenticator with an allow.Admitter.
 func NewAuthenticator(v *Verifier, admit *allow.List) (*Authenticator, error) {
 	if v == nil {
 		return nil, errors.New("googletoken: NewAuthenticator: nil Verifier")
@@ -78,7 +80,28 @@ func NewAuthenticator(v *Verifier, admit *allow.List) (*Authenticator, error) {
 	if admit.Empty() {
 		return nil, errors.New("googletoken: NewAuthenticator: empty allow-list: it admits no one")
 	}
-	return &Authenticator{v: v, allow: admit}, nil
+	if len(admit.Groups()) > 0 {
+		return nil, errors.New("googletoken: NewAuthenticator: the allow-list has group entries: use NewAdmittingAuthenticator with an allow.Admitter that can look them up")
+	}
+	a, err := allow.NewAdmitter(admit, nil)
+	if err != nil {
+		return nil, fmt.Errorf("googletoken: NewAuthenticator: %w", err)
+	}
+	return &Authenticator{v: v, admit: a}, nil
+}
+
+// NewAdmittingAuthenticator builds an Authenticator that admits through
+// an allow.Admitter, which answers for group entries as well as emails
+// and domains. A group lookup that fails is ErrUnavailable, never a
+// refusal.
+func NewAdmittingAuthenticator(v *Verifier, admit *allow.Admitter) (*Authenticator, error) {
+	if v == nil {
+		return nil, errors.New("googletoken: NewAdmittingAuthenticator: nil Verifier")
+	}
+	if admit == nil {
+		return nil, errors.New("googletoken: NewAdmittingAuthenticator: nil Admitter")
+	}
+	return &Authenticator{v: v, admit: admit}, nil
 }
 
 // Authenticate implements authn.Authenticator.
@@ -107,8 +130,16 @@ func (a *Authenticator) Verify(r *http.Request) (Identity, error) {
 	if err != nil {
 		return Identity{}, err
 	}
-	if !a.allow.Admits(id.Email, id.HD) {
+	switch err := a.admit.Admit(r.Context(), id.Email, id.HD); {
+	case errors.Is(err, allow.ErrNotAdmitted):
 		return Identity{}, ErrNotAdmitted
+	case err != nil:
+		// The directory failing is not the directory refusing.
+		err = fmt.Errorf("%w: allow-list group check: %v", ErrUnavailable, err)
+		if a.v.log != nil {
+			a.v.log.WarnContext(r.Context(), "googletoken: could not admit a verified account", "err", err)
+		}
+		return Identity{}, err
 	}
 	return id, nil
 }

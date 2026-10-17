@@ -8,7 +8,29 @@ exported API" in [`CONTRIBUTING.md`](./CONTRIBUTING.md)).
 
 ## [Unreleased]
 
-*Nothing yet.*
+### Added
+
+- **`allow`: Google groups.** `Parse` accepts `group:<group email>`
+  entries (`List.Groups`). `CloudIdentityGroups` is a `GroupChecker` that
+  asks Cloud Identity as the service's own identity:
+  `checkTransitiveMembership`, falling back on its 403 (editions below
+  Workspace Enterprise) to a bounded walk of nested groups with
+  `memberships.list`, cached for 5 minutes so one walk serves every
+  account. An `Admitter` answers for emails, domains and groups, caching
+  group verdicts per account for 5 minutes; a failed lookup is an error,
+  never a refusal and never cached. Taken from kode-gopher
+  `internal/oauth` at `8b53617` with its tests.
+- **`googletoken.NewAdmittingAuthenticator`** admits through an
+  `allow.Admitter`, so Path A can admit by group. A failed group lookup is
+  `ErrUnavailable`, logged without the token.
+
+### Changed
+
+- `allow.Parse` reads an entry starting with `group:` as a group (it
+  previously parsed as an odd email address), and `List.Empty` counts
+  group entries. `List.Admits` never admits through a group.
+- `googletoken.NewAuthenticator` refuses a list with group entries, which
+  it has no way to look up; use `NewAdmittingAuthenticator`.
 
 ## [0.1.0] - 2026-10-15
 

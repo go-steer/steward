@@ -87,9 +87,23 @@ Who is let in, decided after verification:
 - `@domain`, which needs Google's `hd` to name that domain: a consumer
   Google account can carry any company address that once received its
   verification mail, so the email suffix alone never admits;
-- a Google group, by Cloud Identity transitive membership
-  (`groups.memberships.checkTransitiveMembership`, as the service's own
-  identity), cached for 5 minutes. Added after the first release.
+- `group:<group email>`, a Google group, directly or through nested
+  groups. `CloudIdentityGroups` asks Cloud Identity as the service's own
+  identity (or a service account it impersonates; either needs the Groups
+  Reader admin role): `groups.memberships.checkTransitiveMembership`
+  first, and on that call's 403 (Workspace editions below Enterprise do
+  not have it) a breadth-first walk with `memberships.list`, bounded at 10
+  levels and 100 groups. A walk that could not read part of the tree and
+  did not find the member is an error, not a "no". Taken from kode-gopher
+  (`internal/oauth/allow.go` at `8b53617`).
+
+`List.Admits` answers from the list alone and never admits through a
+group. An `Admitter` pairs a `List` with a `GroupChecker` and answers for
+all three kinds, caching group verdicts per account for 5 minutes; a failed
+lookup is an error (on Path A, `ErrUnavailable`), never cached and never a
+refusal. `googletoken.NewAuthenticator` refuses a list with group entries,
+which it could not look up; `NewAdmittingAuthenticator` takes an
+`Admitter`.
 
 An empty list admits no one.
 
