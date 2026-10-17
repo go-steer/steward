@@ -174,15 +174,60 @@ func TestAdmitterCacheBounded(t *testing.T) {
 	if n := len(a.verdicts); n > maxVerdicts {
 		t.Errorf("verdict cache holds %d entries, want at most %d", n, maxVerdicts)
 	}
-	// Expired entries are swept before the cache is cleared.
+	// Expired entries are swept before the cache is cleared: fill it with
+	// old entries and a few fresh ones, and the fresh ones survive.
 	clear(a.verdicts)
-	for i := range maxVerdicts {
+	for i := range maxVerdicts - 3 {
 		_ = a.Admit(context.Background(), fmt.Sprintf("v%d@other.example", i), "")
 	}
 	now = now.Add(GroupVerdictTTL)
+	for i := range 3 {
+		_ = a.Admit(context.Background(), fmt.Sprintf("fresh%d@other.example", i), "")
+	}
 	_ = a.Admit(context.Background(), "late@other.example", "")
-	if n := len(a.verdicts); n != 1 {
-		t.Errorf("after expiry the cache holds %d entries, want 1", n)
+	if n := len(a.verdicts); n != 4 {
+		t.Errorf("after expiry the cache holds %d entries, want the 3 fresh ones and the new one", n)
+	}
+}
+
+// failingGroups fails for the groups in fail and admits members per table.
+type failingGroups struct {
+	fail    map[string]error
+	members map[string]map[string]bool
+}
+
+func (f failingGroups) IsMember(_ context.Context, group, member string) (bool, error) {
+	if err := f.fail[group]; err != nil {
+		return false, err
+	}
+	return f.members[group][member], nil
+}
+
+// Any group admits; a group that cannot be checked does not lock out the
+// members of the others, and a checker error never passes for a refusal.
+func TestAdmitterSeveralGroups(t *testing.T) {
+	t.Parallel()
+	ctx := context.Background()
+	entries := []string{"group:a@cymbal.example", "group:b@cymbal.example"}
+	members := map[string]map[string]bool{"b@cymbal.example": {"bob@other.example": true}}
+
+	healthy := newTestAdmitter(t, entries, failingGroups{members: members})
+	if err := healthy.Admit(ctx, "bob@other.example", ""); err != nil {
+		t.Errorf("member of the second group: %v", err)
+	}
+
+	broken := newTestAdmitter(t, entries, failingGroups{members: members, fail: map[string]error{"a@cymbal.example": errors.New("walk incomplete")}})
+	if err := broken.Admit(ctx, "bob@other.example", ""); err != nil {
+		t.Errorf("member of b while a fails: %v, want admitted", err)
+	}
+	err := broken.Admit(ctx, "eve@other.example", "")
+	if err == nil || errors.Is(err, ErrNotAdmitted) || !strings.Contains(err.Error(), "walk incomplete") {
+		t.Errorf("non-member while a fails: %v, want a non-refusal error naming the failure", err)
+	}
+
+	sly := newTestAdmitter(t, entries[:1], failingGroups{fail: map[string]error{"a@cymbal.example": fmt.Errorf("oops: %w", ErrNotAdmitted)}})
+	if err := sly.Admit(ctx, "eve@other.example", ""); err == nil || errors.Is(err, ErrNotAdmitted) {
+		t.Errorf("checker error wrapping ErrNotAdmitted: %v, want a non-refusal error", err)
 	}
 }
 

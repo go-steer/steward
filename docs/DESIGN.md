@@ -95,15 +95,31 @@ Who is let in, decided after verification:
   not have it) a breadth-first walk with `memberships.list`, bounded at 10
   levels and 100 groups. A walk that could not read part of the tree and
   did not find the member is an error, not a "no". Taken from kode-gopher
-  (`internal/oauth/allow.go` at `8b53617`).
+  (`internal/oauth/allow.go` at `8b53617`), with three fixes from review
+  that should be ported back: a member address with a quote or backslash
+  is matched exactly by the walk instead of being stripped into the
+  transitive call's quoted query (kode-gopher's stripping let `o'brien`
+  match `obrien`); a 404 on a cached group name looks the group up again
+  before it counts as "not a member" (a group deleted and recreated within
+  the hour would otherwise refuse its members); and a group's member
+  listing is capped at 100 pages.
+- Group membership is matched by email, as Cloud Identity keys it. Like an
+  exact-email entry, and unlike a domain entry, a group entry admits any
+  Google account verified for a member's address.
 
 `List.Admits` answers from the list alone and never admits through a
 group. An `Admitter` pairs a `List` with a `GroupChecker` and answers for
-all three kinds, caching group verdicts per account for 5 minutes; a failed
-lookup is an error (on Path A, `ErrUnavailable`), never cached and never a
-refusal. `googletoken.NewAuthenticator` refuses a list with group entries,
-which it could not look up; `NewAdmittingAuthenticator` takes an
-`Admitter`.
+all three kinds, caching group verdicts per account for 5 minutes, so a
+removal takes effect within 10 minutes (a verdict computed from a
+membership list cached for 5). Any group admits; a group that cannot be
+checked does not lock out the members of the others, and only when nothing
+matched is a failure the answer: an error (on Path A, `ErrUnavailable`),
+never cached and never a refusal. Under purser's enforced middleware that
+error is still a 401 on the wire, including a permanent one such as a
+nested group from an external identity source; `Config.Logger` on the
+Verifier is how an operator sees it. `googletoken.NewAuthenticator` refuses
+a list with group entries, which it could not look up;
+`NewAdmittingAuthenticator` takes an `Admitter`.
 
 An empty list admits no one.
 

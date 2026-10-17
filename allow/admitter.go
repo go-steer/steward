@@ -37,7 +37,9 @@ type GroupChecker interface {
 // Limits on the Admitter's verdict cache.
 const (
 	// GroupVerdictTTL is how long a group verdict (admitted or not) is
-	// reused. Removing someone from a group takes effect within this.
+	// reused, and how long CloudIdentityGroups reuses a membership list.
+	// Removing someone from a group therefore takes effect within twice
+	// this when the verdict came from a cached list.
 	GroupVerdictTTL = 5 * time.Minute
 	// maxVerdicts bounds the verdict cache.
 	maxVerdicts = 4096
@@ -99,16 +101,25 @@ func (a *Admitter) Admit(ctx context.Context, email, hd string) error {
 	if ok && now.Sub(v.at) < GroupVerdictTTL {
 		return admitted(v.admitted)
 	}
+	// A group that cannot be checked must not lock out the members of the
+	// others: any match admits, and only if none matched does a failure
+	// become the answer. It is wrapped with %v so that a checker's error
+	// can never pass for ErrNotAdmitted.
 	in := false
+	var failed []error
 	for _, g := range a.groups {
 		member, err := a.check.IsMember(ctx, g, email)
 		if err != nil {
-			return fmt.Errorf("allow: check group %s: %w", g, err)
+			failed = append(failed, fmt.Errorf("group %s: %v", g, err))
+			continue
 		}
 		if member {
 			in = true
 			break
 		}
+	}
+	if !in && len(failed) > 0 {
+		return fmt.Errorf("allow: could not check every group: %w", errors.Join(failed...))
 	}
 	a.mu.Lock()
 	if len(a.verdicts) >= maxVerdicts {

@@ -17,9 +17,14 @@ exported API" in [`CONTRIBUTING.md`](./CONTRIBUTING.md)).
   Workspace Enterprise) to a bounded walk of nested groups with
   `memberships.list`, cached for 5 minutes so one walk serves every
   account. An `Admitter` answers for emails, domains and groups, caching
-  group verdicts per account for 5 minutes; a failed lookup is an error,
-  never a refusal and never cached. Taken from kode-gopher
-  `internal/oauth` at `8b53617` with its tests.
+  group verdicts per account for 5 minutes (a removal takes effect within
+  10); any group admits, a group that cannot be checked does not lock out
+  the others, and a failed lookup is an error, never a refusal and never
+  cached. Taken from kode-gopher `internal/oauth` at `8b53617` with its
+  tests, plus fixes to port back: a member address with a quote is matched
+  exactly instead of being stripped (`o'brien` matched `obrien`), a 404 on
+  a cached group name re-checks the name, and member listings are capped
+  at 100 pages.
 - **`googletoken.NewAdmittingAuthenticator`** admits through an
   `allow.Admitter`, so Path A can admit by group. A failed group lookup is
   `ErrUnavailable`, logged without the token.
@@ -28,7 +33,10 @@ exported API" in [`CONTRIBUTING.md`](./CONTRIBUTING.md)).
 
 - `allow.Parse` reads an entry starting with `group:` as a group (it
   previously parsed as an odd email address), and `List.Empty` counts
-  group entries. `List.Admits` never admits through a group.
+  group entries. `List.Admits` never admits through a group. `Parse` also
+  rejects a domain containing a second `@` (`@a@example.com` used to parse
+  as a domain that matched nothing), so such a configuration now fails at
+  startup.
 - `googletoken.NewAuthenticator` refuses a list with group entries, which
   it has no way to look up; use `NewAdmittingAuthenticator`.
 

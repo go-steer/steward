@@ -27,8 +27,10 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"strings"
+	"sync"
 	"sync/atomic"
 	"testing"
+	"time"
 )
 
 type roundTripFunc func(*http.Request) (*http.Response, error)
@@ -71,14 +73,24 @@ func TestCloudIdentityGroups(t *testing.T) {
 	defer srv.Close()
 	c := &CloudIdentityGroups{Client: srv.Client(), Endpoint: srv.URL + "/"}
 	ctx := context.Background()
-	for member, want := range map[string]bool{"bob@other.example": true, "mallory@gmail.example": false, "ghost@nowhere.example": false} {
-		got, err := c.IsMember(ctx, "G@Cymbal.example", member)
-		if err != nil || got != want {
-			t.Errorf("IsMember(%s) = %v, %v; want %v", member, got, err, want)
+	for _, tc := range []struct {
+		member string
+		want   bool
+	}{{"bob@other.example", true}, {"mallory@gmail.example", false}} {
+		got, err := c.IsMember(ctx, "G@Cymbal.example", tc.member)
+		if err != nil || got != tc.want {
+			t.Errorf("IsMember(%s) = %v, %v; want %v", tc.member, got, err, tc.want)
 		}
 	}
 	if n := lookups.Load(); n != 1 {
-		t.Errorf("group looked up %d times, want 1", n)
+		t.Errorf("group looked up %d times, want 1 (cached)", n)
+	}
+	// A 404 on a cached name re-checks the name once, then is a "no".
+	if got, err := c.IsMember(ctx, "g@cymbal.example", "ghost@nowhere.example"); err != nil || got {
+		t.Errorf("IsMember(ghost) = %v, %v; want false", got, err)
+	}
+	if n := lookups.Load(); n != 2 {
+		t.Errorf("group looked up %d times, want 2", n)
 	}
 	// Every failure is an error, never a "no".
 	for _, tc := range []struct{ group, member string }{
@@ -353,5 +365,187 @@ func TestGroupsWalkPageError(t *testing.T) {
 	c := &CloudIdentityGroups{Client: srv.Client(), Endpoint: srv.URL + "/"}
 	if ok, err := c.IsMember(context.Background(), "g@d.example", "in@d.example"); err == nil || ok {
 		t.Errorf("IsMember with a failing page = %v, %v; want an error", ok, err)
+	}
+}
+
+// A group whose pages never end is an error, not an endless loop.
+func TestGroupsWalkPageLimit(t *testing.T) {
+	t.Parallel()
+	var pages atomic.Int32
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch {
+		case r.URL.Path == "/groups:lookup":
+			writeJSON(w, http.StatusOK, map[string]string{"name": "groups/g"})
+		case strings.HasSuffix(r.URL.Path, ":checkTransitiveMembership"):
+			http.Error(w, "edition", http.StatusForbidden)
+		default:
+			pages.Add(1)
+			writeJSON(w, http.StatusOK, map[string]any{"memberships": []any{}, "nextPageToken": "again"})
+		}
+	}))
+	defer srv.Close()
+	c := &CloudIdentityGroups{Client: srv.Client(), Endpoint: srv.URL + "/"}
+	ok, err := c.IsMember(context.Background(), "g@d.example", "in@d.example")
+	if err == nil || ok || !strings.Contains(err.Error(), "pages") || pages.Load() != maxPages {
+		t.Errorf("endless pages: %v, %v after %d pages; want a page-limit error after %d", ok, err, pages.Load(), maxPages)
+	}
+}
+
+// The transitive call's query quotes the member, so a member with a quote
+// is matched exactly by the walk instead: o'brien is not obrien.
+func TestGroupsQuotedMemberWalks(t *testing.T) {
+	t.Parallel()
+	var transitive atomic.Int32
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch {
+		case r.URL.Path == "/groups:lookup":
+			writeJSON(w, http.StatusOK, map[string]string{"name": "groups/g"})
+		case strings.HasSuffix(r.URL.Path, ":checkTransitiveMembership"):
+			// An edition with the transitive call, which would say yes to
+			// anything it is asked.
+			transitive.Add(1)
+			writeJSON(w, http.StatusOK, map[string]bool{"hasMembership": true})
+		default:
+			writeJSON(w, http.StatusOK, map[string]any{"memberships": []any{
+				map[string]any{"preferredMemberKey": map[string]string{"id": "obrien@d.example"}, "type": "USER"},
+				map[string]any{"preferredMemberKey": map[string]string{"id": `back\slash@d.example`}, "type": "USER"},
+			}})
+		}
+	}))
+	defer srv.Close()
+	c := &CloudIdentityGroups{Client: srv.Client(), Endpoint: srv.URL + "/"}
+	ctx := context.Background()
+	if ok, err := c.IsMember(ctx, "g@d.example", "o'brien@d.example"); err != nil || ok {
+		t.Errorf("o'brien when obrien is the member = %v, %v; want false", ok, err)
+	}
+	if ok, err := c.IsMember(ctx, "g@d.example", `back\slash@d.example`); err != nil || !ok {
+		t.Errorf("a listed member with a backslash = %v, %v; want true", ok, err)
+	}
+	if n := transitive.Load(); n != 0 {
+		t.Errorf("checkTransitiveMembership asked %d times about quoted members", n)
+	}
+}
+
+// A cached group name may be stale: a 404 from the transitive call on a
+// cached name looks the group up again before it is believed.
+func TestGroupsStaleNameRelookup(t *testing.T) {
+	t.Parallel()
+	var mu sync.Mutex
+	current := "groups/old"
+	var lookups atomic.Int32
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		mu.Lock()
+		cur := current
+		mu.Unlock()
+		switch r.URL.Path {
+		case "/groups:lookup":
+			lookups.Add(1)
+			writeJSON(w, http.StatusOK, map[string]string{"name": cur})
+		case "/" + cur + "/memberships:checkTransitiveMembership":
+			if strings.Contains(r.URL.Query().Get("query"), "in@d.example") {
+				writeJSON(w, http.StatusOK, map[string]bool{"hasMembership": true})
+				return
+			}
+			http.Error(w, "no such member", http.StatusNotFound)
+		default:
+			http.Error(w, "no such group", http.StatusNotFound)
+		}
+	}))
+	defer srv.Close()
+	c := &CloudIdentityGroups{Client: srv.Client(), Endpoint: srv.URL + "/"}
+	ctx := context.Background()
+	if ok, err := c.IsMember(ctx, "g@d.example", "in@d.example"); err != nil || !ok {
+		t.Fatalf("first check = %v, %v", ok, err)
+	}
+	// The group is deleted and recreated under a new name.
+	mu.Lock()
+	current = "groups/new"
+	mu.Unlock()
+	if ok, err := c.IsMember(ctx, "g@d.example", "in@d.example"); err != nil || !ok {
+		t.Errorf("member after the group was recreated = %v, %v; want true via a fresh lookup", ok, err)
+	}
+	// A fresh name and a 404 is about the member: not a member, with one
+	// lookup, not a loop.
+	before := lookups.Load()
+	if ok, err := c.IsMember(ctx, "g@d.example", "ghost@d.example"); err != nil || ok {
+		t.Errorf("unknown member = %v, %v; want false", ok, err)
+	}
+	if n := lookups.Load() - before; n != 1 {
+		t.Errorf("unknown member cost %d group lookups, want 1", n)
+	}
+}
+
+// Every cache expires: membership lists after GroupVerdictTTL, names after
+// an hour, and a group's 403 from the transitive call after an hour.
+func TestGroupsCachesExpire(t *testing.T) {
+	t.Parallel()
+	var mu sync.Mutex
+	members := []string{"in@d.example"}
+	transitiveStatus := http.StatusForbidden
+	var lookups, transitive atomic.Int32
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		mu.Lock()
+		defer mu.Unlock()
+		switch {
+		case r.URL.Path == "/groups:lookup":
+			lookups.Add(1)
+			writeJSON(w, http.StatusOK, map[string]string{"name": "groups/g"})
+		case strings.HasSuffix(r.URL.Path, ":checkTransitiveMembership"):
+			transitive.Add(1)
+			if transitiveStatus != http.StatusOK {
+				http.Error(w, "edition", transitiveStatus)
+				return
+			}
+			writeJSON(w, http.StatusOK, map[string]bool{"hasMembership": false})
+		default:
+			var ms []any
+			for _, m := range members {
+				ms = append(ms, map[string]any{"preferredMemberKey": map[string]string{"id": m}, "type": "USER"})
+			}
+			writeJSON(w, http.StatusOK, map[string]any{"memberships": ms})
+		}
+	}))
+	defer srv.Close()
+	now := time.Unix(1_800_000_000, 0)
+	c := &CloudIdentityGroups{Client: srv.Client(), Endpoint: srv.URL + "/", now: func() time.Time { return now }}
+	ctx := context.Background()
+	is := func(member string) bool {
+		t.Helper()
+		ok, err := c.IsMember(ctx, "g@d.example", member)
+		if err != nil {
+			t.Fatal(err)
+		}
+		return ok
+	}
+	if !is("in@d.example") {
+		t.Fatal("member not found")
+	}
+	mu.Lock()
+	members = nil
+	mu.Unlock()
+	now = now.Add(GroupVerdictTTL - time.Second)
+	if !is("in@d.example") {
+		t.Error("membership list not cached")
+	}
+	now = now.Add(time.Second)
+	if is("in@d.example") {
+		t.Error("removed member still found after the list TTL")
+	}
+	if n := lookups.Load(); n != 1 {
+		t.Errorf("group looked up %d times within an hour, want 1", n)
+	}
+	if n := transitive.Load(); n != 1 {
+		t.Errorf("transitive call tried %d times within an hour of its 403, want 1", n)
+	}
+	mu.Lock()
+	transitiveStatus = http.StatusOK
+	mu.Unlock()
+	now = now.Add(time.Hour)
+	_ = is("in@d.example")
+	if n := lookups.Load(); n != 2 {
+		t.Errorf("group looked up %d times after an hour, want 2", n)
+	}
+	if n := transitive.Load(); n != 2 {
+		t.Errorf("transitive call tried %d times an hour after its 403, want 2", n)
 	}
 }
