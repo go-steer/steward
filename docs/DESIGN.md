@@ -217,7 +217,43 @@ The implementation is kode-gopher's (`gke-demos/kode-gopher`,
 `internal/oauth`, `docs/design-in-cluster.md` §3). kode-gopher is in another
 org and will not adopt steward, so the code is taken from a recorded commit
 and fixes are ported by hand in both directions. Tracked in
-k8s-lookout#702.
+k8s-lookout#702. The port is from kode-gopher
+`8b53617b7d4d0b08b158de64ab7416dc84a1281e`.
+
+### Sealing (`seal`)
+
+Everything the authorization server hands out is an AES-256-GCM envelope,
+`st1.<key id>.<base64url(nonce || ciphertext)>`, so nothing is stored and
+any replica holding the keyring opens what another sealed:
+
+- The first key in a `Keyring` seals; every key opens. Replicas reload on
+  their own schedules, so a rotation takes two steps: add the new key
+  second and wait longer than the reload interval (every replica can now
+  open with it), then move it first (every replica seals with it). Drop
+  the old key once everything it sealed has expired (for the authorization
+  server, the 30-day refresh-token life).
+- Key IDs are 1 to 64 of `A-Z a-z 0-9 _ -`, so an envelope is safe in a
+  header, a URL and a form. The key ID and the purpose (access token,
+  refresh token, code, sign-in state, DCR client) are the AEAD's
+  associated data, ID first, so one kind never opens as another and an
+  envelope relabelled to another key does not open. Decoding is strict, so
+  one value has one envelope string (it can key a replay cache).
+- Keyring errors name a line or a position, never key material, even when
+  the columns of a keyring file are swapped.
+- The `st1.` prefix tells an envelope apart from a Google access token in
+  the same `Authorization` header, which is how a protected resource routes
+  a request to the right verifier before verifying anything.
+- A `KeyProvider` supplies the keyring. A `*Keyring` is a static one.
+  `Reloader` re-reads one every 5 minutes (`FileLoader` for a mounted
+  file). One load runs at a time, in the background and detached from the
+  triggering request's context (with a 30 s timeout); first callers share
+  the first load and stop waiting when their own context ends. A failed
+  reload keeps the previous keyring and retries in 30 s, so a key store
+  outage does not sign everyone out.
+- `seal/secretmanager` reads the keyring from a Secret Manager secret
+  version over REST with a caller-supplied `*http.Client` (kode-gopher's
+  Secret Manager key, without the Cloud SDK), using the regional endpoint
+  for a regional secret and checking the payload's CRC32C.
 
 ## Hard rules
 
