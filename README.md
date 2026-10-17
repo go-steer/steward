@@ -12,11 +12,11 @@ to and whether that person is let in, then hands the service a
 **as that person**. What they can see is then what their own IAM and
 Kubernetes RBAC allow.
 
-> **Status: Path A and Path B.** Verification (`googletoken`), admission
+> **Status: v0.2.0, Path A and Path B.** Verification (`googletoken`), admission
 > by email, domain and Google group (`allow`), request wiring
 > (`httpauth`), MCP session binding (`mcpauth`), and steward's own OAuth
 > 2.1 authorization server (`authserver`, with token sealing in `seal`).
-> Pin a [release](./CHANGELOG.md) rather than a commit. Pre-1.0, the
+> Pin [`v0.2.0`](./CHANGELOG.md) rather than a commit. Pre-1.0, the
 > exported API may break at a minor version. See
 > [`docs/DESIGN.md`](./docs/DESIGN.md).
 
