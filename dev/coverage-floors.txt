@@ -34,3 +34,8 @@ github.com/go-steer/steward/googletoken        96.0  # 97.4
 # purser NewCaller failure that its own validation makes unreachable.
 github.com/go-steer/steward/httpauth           96.0  # 97.4
 github.com/go-steer/steward/mcpauth           100.0
+
+# Sealing. seal's remainder is the crypto/rand and AES/GCM construction
+# error arms, which a 32-byte key and a working kernel never reach.
+github.com/go-steer/steward/seal               96.5  # 97.5
+github.com/go-steer/steward/seal/secretmanager 100.0

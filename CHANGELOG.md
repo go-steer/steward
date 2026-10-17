@@ -10,6 +10,22 @@ exported API" in [`CONTRIBUTING.md`](./CONTRIBUTING.md)).
 
 ### Added
 
+- **`seal`: stateless, rotatable token envelopes** (Path B groundwork,
+  k8s-lookout#702). A `Keyring` seals values as AES-256-GCM envelopes
+  (`st1.<key id>.…`) bound to a purpose; the first key seals and every key
+  opens, so keys rotate without a database (in two steps across replicas:
+  see the package doc). `ParseKeyring` and `LoadKeyring` read the
+  `<id> <base64 key>` text form, and no error quotes key material. A
+  `KeyProvider` supplies the keyring: a `*Keyring` itself, or a `Reloader`
+  that re-reads it in the background every few minutes, shares one load
+  among waiting callers, and keeps the previous keyring when a reload
+  fails. Taken from kode-gopher `internal/oauth` at `8b53617`, with key IDs
+  restricted to `A-Z a-z 0-9 _ -`, unambiguous associated data and strict
+  decoding.
+- **`seal/secretmanager`: keys from Secret Manager** without the Cloud SDK:
+  `Source.Load` reads a secret version over REST with a caller-supplied
+  `*http.Client` (the regional endpoint for a regional secret) and checks
+  its CRC32C; `NewProvider` wraps a `Source` in a `Reloader`.
 - **`allow`: Google groups.** `Parse` accepts `group:<group email>`
   entries (`List.Groups`). `CloudIdentityGroups` is a `GroupChecker` that
   asks Cloud Identity as the service's own identity:
