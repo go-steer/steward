@@ -113,12 +113,18 @@ force-push `main`. Full contributor flow + DCO in
 
 ## Current state
 
-**v0.1.0: Path A.** `googletoken` (the verifier and a purser
-authenticator, moved from supercargo), `allow`, `httpauth` (the Protector:
-purser's enforced middleware, the token source, RFC 9728 metadata) and
-`mcpauth` (SDK session binding and per-call tokens), on purser v0.2.0.
-Tagged, so `verify-apidiff` now has a baseline. k8s-lookout adopts it next
-(k8s-lookout#699); supercargo keeps its own copy for now, so a fix to
-`googletoken` that applies there is ported by hand. Later: `signin`, group
-allow-lists, Path B. See the phase table in
-[`docs/DESIGN.md`](./docs/DESIGN.md).
+**v0.2.0: Path A and Path B.** v0.1.0 shipped Path A: `googletoken` (the
+verifier and a purser authenticator, moved from supercargo), `allow`,
+`httpauth` (the Protector: purser's enforced middleware, the token source,
+RFC 9728 metadata) and `mcpauth` (SDK session binding and per-call
+tokens), on purser v0.2.0. v0.2.0 adds Path B for k8s-lookout#702:
+`allow` groups (`CloudIdentityGroups`, `Admitter`), `seal` (rotatable AEAD
+envelopes; Secret Manager keys in `seal/secretmanager`), `authserver`
+(the OAuth 2.1 authorization server: DCR, CIMD, static clients, PKCE,
+resource indicators, client credentials, vault and sealed custody,
+refresh-token families) and both token kinds in one `httpauth.Protector`
+and `mcpauth`. `allow`'s group checker, `seal` and `authserver` are taken
+from kode-gopher at `8b53617`, which will not import steward: port fixes
+by hand in both directions (DESIGN.md lists the ones made here).
+supercargo keeps its own `googletoken` copy for now. Later: `signin`. See
+the phase table in [`docs/DESIGN.md`](./docs/DESIGN.md).

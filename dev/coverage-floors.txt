@@ -31,8 +31,10 @@ github.com/go-steer/steward/allow             100.0
 github.com/go-steer/steward/googletoken        96.0  # 97.4
 
 # Wiring. httpauth's remainder is New's arms for a json.Marshal or
-# purser NewCaller failure that its own validation makes unreachable.
-github.com/go-steer/steward/httpauth           96.0  # 97.4
+# purser NewCaller failure that its own validation makes unreachable, and
+# the closed default for a Path B person with no Google token, which
+# authserver.Verify never yields.
+github.com/go-steer/steward/httpauth           96.0  # 96.7
 github.com/go-steer/steward/mcpauth           100.0
 
 # Sealing. seal's remainder is the crypto/rand and AES/GCM construction
@@ -45,3 +47,8 @@ github.com/go-steer/steward/seal/secretmanager 100.0
 # that worked a moment earlier), and request-construction errors on
 # operator-configured endpoints.
 github.com/go-steer/steward/authserver         95.0  # 96.1
+
+# Test helpers (a fake Google sign-in, a consent-approving browser), used
+# by httpauth's and mcpauth's tests and measured there; they have no tests
+# of their own, so their own number is zero by construction.
+github.com/go-steer/steward/internal/pathbtest   0.0
