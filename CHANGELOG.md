@@ -10,6 +10,26 @@ exported API" in [`CONTRIBUTING.md`](./CONTRIBUTING.md)).
 
 ### Added
 
+- **`authserver`: steward's OAuth 2.1 authorization server** (Path B,
+  k8s-lookout#702). A service mounts it at an issuer URL in front of
+  Google sign-in, so MCP clients that discover and register with an
+  authorization server can sign people in. Metadata (RFC 8414), DCR,
+  Client ID Metadata Documents and pre-registered clients; PKCE (S256
+  only); resource indicators (RFC 8707) binding every token to the
+  protected resource; service-defined scopes beside the Google scopes held
+  upstream; the client-credentials grant for workloads, with an optional
+  service account. The allow-list (`allow.Admitter`) is checked at sign-in
+  and at every refresh. `Custody` holds the user's Google grant: the Agent
+  Identity credential vault (`VaultCustody`, which checks every vault token's
+  tokeninfo `sub` and scopes, spells scopes canonically, and ignores the
+  vault's `expireTime`) or the Google refresh token sealed in steward's own
+  (`SealedCustody`). Every token, code and DCR client ID is sealed, so
+  nothing is stored; spent codes and rotated refresh tokens go in a
+  pluggable `ReplayCache`. `Server.Verify` and `Server.Authenticator` (a
+  purser authenticator, verdict `oidc`) check access tokens and yield a
+  `Principal` with the same `purser.Caller` Path A gives a person. No MCP
+  SDK. Taken from kode-gopher `internal/oauth` at `8b53617` with its tests
+  (harness, end-to-end flows, client credentials, units), generalized.
 - **`seal`: stateless, rotatable token envelopes** (Path B groundwork,
   k8s-lookout#702). A `Keyring` seals values as AES-256-GCM envelopes
   (`st1.<key id>.…`) bound to a purpose; the first key seals and every key
