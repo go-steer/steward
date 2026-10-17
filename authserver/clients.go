@@ -31,6 +31,7 @@ import (
 	"sync"
 	"syscall"
 	"time"
+	"unicode/utf8"
 
 	"github.com/go-steer/steward/seal"
 )
@@ -123,6 +124,18 @@ type dcrClient struct {
 }
 
 var errUnknownClient = errors.New("unknown client")
+
+// errCIMDUnavailable is a client's metadata document that could not be
+// fetched right now (no answer, 5xx, 429): the client's host failing, not
+// the client being unknown.
+var errCIMDUnavailable = errors.New("client metadata document unavailable")
+
+// clientUnavailable reports whether a resolveClient error is a transient
+// failure (our keys, or the client's metadata host) rather than an unknown
+// client.
+func clientUnavailable(err error) bool {
+	return errors.Is(err, errKeys) || errors.Is(err, errCIMDUnavailable)
+}
 
 // resolveClient finds the client a client_id names: pre-registered, a
 // sealed DCR registration, or a CIMD URL.
@@ -255,15 +268,18 @@ func (f *cimdFetcher) fetch(ctx context.Context, id string) (*client, error) {
 	req.Header.Set("Accept", "application/json")
 	resp, err := f.hc.Do(req) //nolint:gosec // G704: a client-supplied URL, fetched with SSRFSafeClient
 	if err != nil {
-		return nil, fmt.Errorf("fetch client metadata: %w", err)
+		return nil, fmt.Errorf("%w: %w", errCIMDUnavailable, err)
 	}
 	defer func() { _ = resp.Body.Close() }()
+	if resp.StatusCode >= http.StatusInternalServerError || resp.StatusCode == http.StatusTooManyRequests {
+		return nil, fmt.Errorf("%w: HTTP %d", errCIMDUnavailable, resp.StatusCode)
+	}
 	if resp.StatusCode != http.StatusOK {
 		return nil, fmt.Errorf("fetch client metadata: HTTP %d", resp.StatusCode)
 	}
 	b, err := io.ReadAll(io.LimitReader(resp.Body, cimdMaxBytes+1))
 	if err != nil {
-		return nil, fmt.Errorf("fetch client metadata: %w", err)
+		return nil, fmt.Errorf("%w: %w", errCIMDUnavailable, err)
 	}
 	if len(b) > cimdMaxBytes {
 		return nil, errors.New("client metadata document is too large")
@@ -290,11 +306,7 @@ func (f *cimdFetcher) fetch(ctx context.Context, id string) (*client, error) {
 			return nil, fmt.Errorf("client metadata redirect URI %q isn't allowed", r)
 		}
 	}
-	name := doc.ClientName
-	if len(name) > 100 {
-		name = name[:100]
-	}
-	c := &client{ID: id, Name: name, RedirectURIs: doc.RedirectURIs}
+	c := &client{ID: id, Name: truncate(doc.ClientName, maxClientName), RedirectURIs: doc.RedirectURIs}
 	if ttl := cacheTTL(resp.Header.Get("Cache-Control")); ttl > 0 {
 		now := time.Now()
 		f.mu.Lock()
@@ -312,6 +324,20 @@ func (f *cimdFetcher) fetch(ctx context.Context, id string) (*client, error) {
 		f.mu.Unlock()
 	}
 	return c, nil
+}
+
+// maxClientName bounds a client name shown on the consent page and logged.
+const maxClientName = 100
+
+// truncate cuts s to at most n bytes, on a character boundary.
+func truncate(s string, n int) string {
+	if len(s) <= n {
+		return s
+	}
+	for n > 0 && !utf8.RuneStart(s[n]) {
+		n--
+	}
+	return s[:n]
 }
 
 // cacheTTL reads max-age from Cache-Control, capped; no-store and no-cache
@@ -364,9 +390,32 @@ func SSRFSafeClient(timeout time.Duration) *http.Client {
 	}
 }
 
-var cgnat = netip.MustParsePrefix("100.64.0.0/10")
+// nonPublic are special-purpose ranges that IsGlobalUnicast admits but a
+// client-supplied URL must not reach: shared address space, IETF protocol
+// assignments, benchmarking, the 6to4 relay anycast, reserved space, and
+// the IPv6 translation and tunnelling prefixes, which embed an IPv4 address
+// (NAT64 64:ff9b::/96 reaches 169.254.169.254 as 64:ff9b::a9fe:a9fe).
+var nonPublic = []netip.Prefix{
+	netip.MustParsePrefix("100.64.0.0/10"),
+	netip.MustParsePrefix("192.0.0.0/24"),
+	netip.MustParsePrefix("192.88.99.0/24"),
+	netip.MustParsePrefix("198.18.0.0/15"),
+	netip.MustParsePrefix("240.0.0.0/4"),
+	netip.MustParsePrefix("64:ff9b::/96"),
+	netip.MustParsePrefix("64:ff9b:1::/48"),
+	netip.MustParsePrefix("2001::/32"),
+	netip.MustParsePrefix("2002::/16"),
+}
 
 func isPublic(ip netip.Addr) bool {
 	ip = ip.Unmap()
-	return ip.IsGlobalUnicast() && !ip.IsPrivate() && !cgnat.Contains(ip)
+	if !ip.IsGlobalUnicast() || ip.IsPrivate() {
+		return false
+	}
+	for _, p := range nonPublic {
+		if p.Contains(ip) {
+			return false
+		}
+	}
+	return true
 }

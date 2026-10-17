@@ -24,12 +24,15 @@ exported API" in [`CONTRIBUTING.md`](./CONTRIBUTING.md)).
   tokeninfo `sub` and scopes, spells scopes canonically, and ignores the
   vault's `expireTime`) or the Google refresh token sealed in steward's own
   (`SealedCustody`). Every token, code and DCR client ID is sealed, so
-  nothing is stored; spent codes and rotated refresh tokens go in a
-  pluggable `ReplayCache`. `Server.Verify` and `Server.Authenticator` (a
-  purser authenticator, verdict `oidc`) check access tokens and yield a
-  `Principal` with the same `purser.Caller` Path A gives a person. No MCP
-  SDK. Taken from kode-gopher `internal/oauth` at `8b53617` with its tests
-  (harness, end-to-end flows, client credentials, units), generalized.
+  nothing is stored; a pluggable `ReplayCache` spends codes and tracks
+  refresh-token families, revoking a family whose rotated token is reused
+  (OAuth 2.1 §4.3.1). `Server.Verify` and `Server.Authenticator` (a purser
+  authenticator, verdict `oidc` for persons and workloads alike) check
+  access tokens and yield a `Principal` with the same `purser.Caller` Path
+  A gives a person. No MCP SDK. Taken from kode-gopher `internal/oauth` at
+  `8b53617` with its tests (harness, end-to-end flows, client credentials,
+  units), generalized, and hardened by review in ways worth porting back
+  (see DESIGN.md, "Differences from kode-gopher").
 - **`seal`: stateless, rotatable token envelopes** (Path B groundwork,
   k8s-lookout#702). A `Keyring` seals values as AES-256-GCM envelopes
   (`st1.<key id>.…`) bound to a purpose; the first key seals and every key

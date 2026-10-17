@@ -37,7 +37,7 @@ import (
 // register is DCR for a public client redirecting to clientRedirect.
 func (e *testEnv) register() string {
 	e.t.Helper()
-	resp, err := http.Post(e.srv.URL+"/register", "application/json", strings.NewReader(`{"client_name":"t","redirect_uris":["`+clientRedirect+`"]}`))
+	resp, err := hc.Post(e.srv.URL+"/register", "application/json", strings.NewReader(`{"client_name":"t","redirect_uris":["`+clientRedirect+`"]}`))
 	if err != nil {
 		e.t.Fatal(err)
 	}
@@ -109,7 +109,7 @@ func (e *testEnv) token(form url.Values, basicID, basicSecret string) tokenResp 
 	if basicID != "" {
 		req.SetBasicAuth(url.QueryEscape(basicID), url.QueryEscape(basicSecret))
 	}
-	resp, err := http.DefaultClient.Do(req)
+	resp, err := hc.Do(req)
 	if err != nil {
 		e.t.Fatal(err)
 	}
@@ -193,7 +193,7 @@ func TestE2EPreregisteredSealed(t *testing.T) {
 		t.Errorf("sealed custody sign-in asked Google for %q offline=%q", a.Get("scope"), a.Get("access_type"))
 	}
 	// Closed registration: no DCR endpoint served.
-	resp, err := http.Post(e.srv.URL+"/register", "application/json", strings.NewReader(`{}`))
+	resp, err := hc.Post(e.srv.URL+"/register", "application/json", strings.NewReader(`{}`))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -441,7 +441,7 @@ func TestAuthorizeRejects(t *testing.T) {
 		{"redirect_uri": "https://evil.example/cb"},
 	}
 	for _, set := range pages {
-		resp, err := http.Get(e.authorizeURL(id, v, set))
+		resp, err := hc.Get(e.authorizeURL(id, v, set))
 		if err != nil {
 			t.Fatal(err)
 		}
@@ -471,7 +471,7 @@ func TestConsentForgery(t *testing.T) {
 	t.Parallel()
 	e := newTestEnv(t, false, nil)
 	id := e.register()
-	resp, err := http.Get(e.authorizeURL(id, rand.Text()+rand.Text(), nil))
+	resp, err := hc.Get(e.authorizeURL(id, rand.Text()+rand.Text(), nil))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -482,7 +482,7 @@ func TestConsentForgery(t *testing.T) {
 		t.Fatal("no consent form")
 	}
 	// The victim's browser has no binding cookie for this request.
-	resp, err = http.PostForm(e.srv.URL+"/authorize", url.Values{"request": {html.UnescapeString(m[1])}, "action": {"approve"}})
+	resp, err = hc.PostForm(e.srv.URL+"/authorize", url.Values{"request": {html.UnescapeString(m[1])}, "action": {"approve"}})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -491,7 +491,7 @@ func TestConsentForgery(t *testing.T) {
 		t.Errorf("consent without the binding cookie: HTTP %d, want 400", resp.StatusCode)
 	}
 	// Nor does a callback carrying someone else's state.
-	resp, err = http.Get(e.as.CallbackURL() + "?state=st1.k1.AAAA&code=x")
+	resp, err = hc.Get(e.as.CallbackURL() + "?state=st1.k1.AAAA&code=x")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -499,7 +499,7 @@ func TestConsentForgery(t *testing.T) {
 	if resp.StatusCode != http.StatusBadRequest {
 		t.Errorf("callback with a forged state: HTTP %d, want 400", resp.StatusCode)
 	}
-	resp, err = http.Get(e.as.ContinueURL() + "?user_id_validation_state=x")
+	resp, err = hc.Get(e.as.ContinueURL() + "?user_id_validation_state=x")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -536,15 +536,34 @@ func TestRefresh(t *testing.T) {
 	if status, got, _ := e.call(second.Access); status != http.StatusOK {
 		t.Errorf("refreshed access token refused: %d %s", status, got)
 	}
+	third := e.token(refreshForm(id, second.Refresh), "", "")
+	if third.status != http.StatusOK {
+		t.Fatalf("second refresh: %+v", third)
+	}
+	// Reusing a rotated refresh token revokes its whole family (OAuth 2.1
+	// section 4.3.1): the newest token in it stops working too.
 	if r := e.token(refreshForm(id, first.Refresh), "", ""); r.Error != "invalid_grant" {
 		t.Errorf("reused refresh token: %q, want invalid_grant", r.Error)
 	}
+	if r := e.token(refreshForm(id, third.Refresh), "", ""); r.Error != "invalid_grant" {
+		t.Errorf("newest refresh token after a reuse revoked its family: %q, want invalid_grant", r.Error)
+	}
 
 	// Removed from the group: refused once the cached decision ages out.
+	id2, fresh := e.signIn(newBrowser(t))
 	e.groups.remove("kg-users@example.com", bob.Email)
 	e.as.cfg.Admit = newAdmitter(t, e.groups)
-	if r := e.token(refreshForm(id, second.Refresh), "", ""); r.Error != "invalid_grant" {
-		t.Errorf("refresh after removal from the allow-list: %q", r.Error)
+	if r := e.token(refreshForm(id2, fresh.Refresh), "", ""); r.Error != "invalid_grant" || !strings.Contains(r.Desc, "allowed") {
+		t.Errorf("refresh after removal from the allow-list: %+v", r)
+	}
+	// The refusal keeps the token spent: restoring the membership does not
+	// revive it.
+	e.groups.mu.Lock()
+	e.groups.members["kg-users@example.com"][bob.Email] = true
+	e.groups.mu.Unlock()
+	e.as.cfg.Admit = newAdmitter(t, e.groups)
+	if r := e.token(refreshForm(id2, fresh.Refresh), "", ""); r.Error != "invalid_grant" {
+		t.Errorf("refused refresh token used again: %+v", r)
 	}
 }
 
@@ -691,7 +710,7 @@ func TestMetadata(t *testing.T) {
 	t.Parallel()
 	e := newTestEnv(t, false, nil)
 	get := func(path string) map[string]any {
-		resp, err := http.Get(e.srv.URL + path)
+		resp, err := hc.Get(e.srv.URL + path)
 		if err != nil {
 			t.Fatal(err)
 		}
@@ -722,7 +741,7 @@ func TestMetadata(t *testing.T) {
 		t.Errorf("MetadataURL = %s", e.as.MetadataURL())
 	}
 	req, _ := http.NewRequest(http.MethodOptions, e.srv.URL+"/token", nil)
-	resp, err := http.DefaultClient.Do(req)
+	resp, err := hc.Do(req)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -732,7 +751,7 @@ func TestMetadata(t *testing.T) {
 	}
 	for _, m := range []struct{ method, path string }{{http.MethodPost, "/.well-known/oauth-authorization-server"}, {http.MethodGet, "/token"}, {http.MethodGet, "/register"}} {
 		req, _ := http.NewRequest(m.method, e.srv.URL+m.path, nil)
-		resp, err := http.DefaultClient.Do(req)
+		resp, err := hc.Do(req)
 		if err != nil {
 			t.Fatal(err)
 		}

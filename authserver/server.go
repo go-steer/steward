@@ -32,13 +32,12 @@
 //
 // Everything handed out is sealed (package seal), so nothing is stored
 // and any replica holding the keyring verifies any token. The one piece
-// of state is a ReplayCache for spent authorization codes and rotated
-// refresh tokens; the default is in memory, per replica.
+// of state is a ReplayCache that spends authorization codes and tracks
+// refresh-token families; the default is in memory, per replica.
 //
 // The protected resource verifies access tokens with Server.Verify, or
-// with the purser authenticator from Server.Authenticator; httpauth's
-// Protector does that for a resource that accepts both these tokens and
-// Google's own (Path A). Nothing here imports the MCP SDK.
+// with the purser authenticator from Server.Authenticator. Nothing here
+// imports the MCP SDK.
 //
 // Taken from gke-demos/kode-gopher internal/oauth at
 // 8b53617b7d4d0b08b158de64ab7416dc84a1281e (docs/design-in-cluster.md
@@ -57,9 +56,9 @@ import (
 	"log/slog"
 	"net/http"
 	"net/url"
+	"regexp"
 	"slices"
 	"strings"
-	"sync"
 	"time"
 
 	"github.com/go-steer/steward/allow"
@@ -239,6 +238,33 @@ func New(cfg Config) (*Server, error) {
 	if err != nil {
 		return nil, err
 	}
+	if strings.ContainsAny(iss.Path, "{}") || iss.RawPath != "" {
+		return nil, fmt.Errorf("authserver: New: Issuer %q: the path must be plain (no escapes or braces)", cfg.Issuer)
+	}
+	// The ID token is trusted for coming straight from Google's token
+	// endpoint over TLS, so the endpoints must be https (loopback http for
+	// tests).
+	for field, raw := range map[string]string{
+		"Google.AuthURL": cfg.Google.AuthURL, "Google.TokenURL": cfg.Google.TokenURL, "Google.TokenInfoURL": cfg.Google.TokenInfoURL,
+	} {
+		if raw != "" {
+			if _, err := checkURL(field, raw); err != nil {
+				return nil, err
+			}
+		}
+	}
+	if v, ok := cfg.Custody.(*VaultCustody); ok {
+		switch {
+		case v == nil || v.Client == nil:
+			return nil, errors.New("authserver: New: VaultCustody needs a Client")
+		case !authProviderRE.MatchString(v.AuthProvider):
+			return nil, fmt.Errorf("authserver: New: VaultCustody.AuthProvider %q: want projects/<p>/locations/<l>/authProviders/<name>", v.AuthProvider)
+		case v.Endpoint != "":
+			if _, err := checkURL("VaultCustody.Endpoint", strings.TrimSuffix(v.Endpoint, "/")); err != nil {
+				return nil, err
+			}
+		}
+	}
 	cfg.Google.applyDefaults()
 	if cfg.HTTPClient == nil {
 		cfg.HTTPClient = &http.Client{Timeout: 30 * time.Second}
@@ -251,13 +277,14 @@ func New(cfg Config) (*Server, error) {
 		issuer:        iss,
 		scopes:        scopes,
 		defaultScopes: defaults,
-		google:        &upstream{client: &cfg.Google, hc: cfg.HTTPClient, scopes: gscopes},
 		static:        map[string]StaticClient{},
 		cimd:          newCIMDFetcher(cfg.CIMDClient),
 		used:          cfg.Replay,
 		log:           cfg.Logger,
 		now:           time.Now,
 	}
+	s.cfg.Clients = nil // copied into s.static below
+	s.google = &upstream{client: &s.cfg.Google, hc: s.cfg.HTTPClient, scopes: gscopes}
 	if s.used == nil {
 		s.used = NewMemoryReplayCache()
 	}
@@ -271,9 +298,12 @@ func New(cfg Config) (*Server, error) {
 		if err := c.validate(); err != nil {
 			return nil, fmt.Errorf("authserver: New: %w", err)
 		}
-		if _, err := checkScopes("client "+c.ID+" Scopes", c.Scopes, scopes); err != nil {
+		cs, err := checkScopes("client "+c.ID+" Scopes", c.Scopes, scopes)
+		if err != nil {
 			return nil, err
 		}
+		// Copies, so the caller's slices cannot change a client after New.
+		c.Scopes, c.RedirectURIs = cs, slices.Clone(c.RedirectURIs)
 		s.static[c.ID] = c
 		s.serviceClients = s.serviceClients || c.clientCredentials()
 		if c.ServiceAccount != "" && cfg.ServiceTokens == nil {
@@ -282,6 +312,8 @@ func New(cfg Config) (*Server, error) {
 	}
 	return s, nil
 }
+
+var authProviderRE = regexp.MustCompile(`^projects/[A-Za-z0-9_-]+/locations/[a-z0-9-]+/authProviders/[A-Za-z0-9_-]+$`)
 
 // checkURL requires an absolute https URL (http only for a loopback host)
 // with no query, fragment or userinfo.
@@ -486,74 +518,4 @@ func writeJSON(w http.ResponseWriter, code int, v any) {
 	w.Header().Set("Cache-Control", "no-store")
 	w.WriteHeader(code)
 	_ = json.NewEncoder(w).Encode(v)
-}
-
-// ReplayCache remembers single-use IDs (authorization codes, rotated
-// refresh tokens) until they would have expired anyway. Implementations
-// must be safe for concurrent use. An error is a cache that could not
-// answer; the token endpoint then answers server_error and spends
-// nothing.
-type ReplayCache interface {
-	// Claim records id as used until exp, and reports whether it was
-	// unused (or its earlier claim has expired).
-	Claim(ctx context.Context, id string, exp time.Time) (bool, error)
-	// Release forgets id, for a use that failed for a transient reason,
-	// so the client's retry is not refused as a replay.
-	Release(ctx context.Context, id string) error
-}
-
-// maxMemoryClaims bounds the in-memory replay cache (a claim is about a
-// hundred bytes, and only a signed-in user's code or refresh can add
-// one). Past it, expired claims are swept; if none have expired, a new
-// claim is refused rather than an old one forgotten.
-const maxMemoryClaims = 1 << 20
-
-// MemoryReplayCache is the in-memory ReplayCache: per process, and
-// forgotten on restart (a refresh token rotated just before a restart
-// could be used once more).
-type MemoryReplayCache struct {
-	mu   sync.Mutex
-	seen map[string]time.Time
-	now  func() time.Time
-}
-
-// NewMemoryReplayCache returns an empty in-memory ReplayCache.
-func NewMemoryReplayCache() *MemoryReplayCache {
-	return &MemoryReplayCache{seen: map[string]time.Time{}, now: time.Now}
-}
-
-var _ ReplayCache = (*MemoryReplayCache)(nil)
-
-// errReplayFull is the in-memory cache refusing a claim it has no room
-// for: refusing is safe, forgetting a claim is not.
-var errReplayFull = errors.New("authserver: replay cache is full")
-
-// Claim implements ReplayCache.
-func (c *MemoryReplayCache) Claim(_ context.Context, id string, exp time.Time) (bool, error) {
-	c.mu.Lock()
-	defer c.mu.Unlock()
-	now := c.now()
-	if e, ok := c.seen[id]; ok && now.Before(e) {
-		return false, nil
-	}
-	if len(c.seen) >= maxMemoryClaims {
-		for k, e := range c.seen {
-			if !now.Before(e) {
-				delete(c.seen, k)
-			}
-		}
-		if len(c.seen) >= maxMemoryClaims {
-			return false, errReplayFull
-		}
-	}
-	c.seen[id] = exp
-	return true, nil
-}
-
-// Release implements ReplayCache.
-func (c *MemoryReplayCache) Release(_ context.Context, id string) error {
-	c.mu.Lock()
-	defer c.mu.Unlock()
-	delete(c.seen, id)
-	return nil
 }

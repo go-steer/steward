@@ -278,30 +278,48 @@ resource serves it (`httpauth`), naming this issuer.
 64 KiB, cached per `Cache-Control` up to an hour). DCR and CIMD clients
 get a consent page naming the client and its redirect host before Google
 sign-in, because one Google client fronts them all; pre-registered clients
-skip it. The flow is bound to the browser by a random cookie whose hash
-rides in the sealed state. Redirect URIs match exactly, except a loopback
-redirect may use any port (RFC 8252).
+skip it. The flow is bound to the browser by a random cookie (`__Host-`
+prefixed when the issuer allows it) whose hash rides in the sealed state,
+so neither the consent form nor Google's callback works in another
+browser. Redirect URIs match exactly, except a loopback redirect may use
+any port (RFC 8252). Why a client could not be resolved (a CIMD document's
+contents, a dial error naming an internal address) goes to the log only;
+a CIMD host that is down, or our keys being unavailable, is a 503 page or
+`server_error`, not "unknown client".
 
-**Authorization requests.** `response_type=code`, PKCE with S256 only,
-and a `resource` (RFC 8707) that, if present, must be `Config.Resource`;
-every token is bound to it and the verifier refuses any other. Service
-scopes (`Config.Scopes`, for lookout `lookout:read` and `lookout:write`)
-are granted as requested where they exist and the client may have them
-(`StaticClient.Scopes`), others dropped (RFC 6749 §3.3); a request naming
-none gets `DefaultScopes`. A refresh may narrow the scope, never widen it.
+**Authorization requests.** `response_type=code`, PKCE with S256 only
+(the verifier is RFC 7636's 43 to 128 unreserved characters), and a
+`resource` (RFC 8707) that, if present, must be `Config.Resource` (one
+of them); every token is bound to it and the verifier refuses any other.
+Service scopes (`Config.Scopes`, for lookout `lookout:read` and
+`lookout:write`) are granted as requested where they exist and the client
+may have them (`StaticClient.Scopes`), others dropped (RFC 6749 §3.3); a
+request naming none of them gets `DefaultScopes`. The client-credentials
+grant drops scopes the same way, because MCP clients ask for every scope
+the resource advertises. A refresh may narrow the access token's scope,
+never widen it, and the new refresh token keeps the whole grant (RFC 6749
+§6). Every refresh re-intersects the grant with what the configuration
+still allows the client, and `Verify` does the same for a live access
+token, so narrowing a client's scopes takes effect within one access-token
+life.
 
 **Google.** Sign-in asks Google for `openid` and `userinfo.email`, plus,
 under sealed custody, `GoogleScopes` (default `cloud-platform`) offline.
 The ID token comes straight from Google's token endpoint over TLS, so its
-claims are checked and its signature is not (OIDC Core §3.1.3.7). Google
-scopes must be spelled as Google's canonical URLs, because the vault
-matches stored grants by exact spelling.
+claims are checked and its signature is not (OIDC Core §3.1.3.7); `New`
+therefore requires Google's endpoints (and the vault's) to be https.
+Google scopes must be spelled as Google's canonical URLs, because the
+vault matches stored grants by exact spelling.
 
 **Admission.** `Config.Admit`, an `allow.Admitter`, is asked at the
 callback and again at every refresh. A refusal is `access_denied` at
-sign-in and `invalid_grant` at refresh; a lookup that fails is
+sign-in (the description does not name the account) and `invalid_grant`
+at refresh, and keeps the refresh token spent; a lookup that fails is
 `server_error` and, at refresh, gives the refresh token back so the
-client's retry works.
+client's retry works. If the account's email has changed since sign-in
+(the vault's tokeninfo, or the ID token Google returns with a refresh,
+says so), the refresh is `invalid_grant`: the identity and admission
+sealed in the refresh token are stale.
 
 **Custody** is a sealed interface (only this package implements it):
 
@@ -316,19 +334,33 @@ client's retry works.
 - `SealedCustody`: the Google refresh token rides inside steward's sealed
   refresh token.
 
+A grant only the user can repair (consent declined, another account's
+grant, a missing scope) is `access_denied` at sign-in and `invalid_grant`
+at refresh; Google or the vault failing is `server_error`, and a retry may
+work.
+
 **Tokens.** All sealed, the issuer bound into every purpose:
 
 | Token | Carries | Life |
 |---|---|---|
 | authorization code | the request, the user, the Google access token (and refresh token, sealed custody) | 1 min, single use |
 | access token | sub, email, hd, client, resource, scopes, the Google access token and its expiry | 15 min, never past the Google token's life minus a minute |
-| refresh token | the user, client, resource, scopes, the Google refresh token (sealed custody only) | 30 days, renewed by each use, rotated every time |
+| refresh token | the user, client, resource, scopes, the Google refresh token (sealed custody only), its family and generation | 30 days, renewed by each use, rotated every time |
 
-**Replay.** Spent codes and rotated refresh tokens go in a `ReplayCache`.
-The default is in memory, so with several replicas a code or a rotated
-refresh token could be used once on each (PKCE still binds a code to its
-client's verifier); a service that runs replicas supplies a shared cache.
-A cache that cannot answer is `server_error`, never a pass.
+**Replay.** A `ReplayCache` spends authorization codes and tracks
+refresh-token families (OAuth 2.1 §4.3.1). Every refresh token belongs to
+the family its sign-in started, with a generation number; a refresh moves
+the family to the next generation. Presenting a generation the family has
+moved past is a replay, so the whole family is revoked and the user signs
+in again. Storage grows with live families (one per sign-in per client),
+not with refreshes. The default is in memory: across replicas or a
+restart, a rotated token can be used once more where its family is not
+known (a later generation, which only another replica can have minted,
+moves the family on rather than revoking it; PKCE still binds a code to
+its client's verifier). A service that runs replicas supplies a shared
+`ReplayCache`. A cache that cannot answer is `server_error`, never a pass.
+There is no grace period: a client that loses a refresh response and
+retries with the old token signs in again.
 
 **Client credentials.** A pre-registered confidential client with
 `ClientCredentials` (or a `ServiceAccount`, which implies it) gets an
@@ -336,8 +368,8 @@ access token with its secret alone, and no refresh token. Its subject is
 `client:<id>`. With a `ServiceAccount`, `Config.ServiceTokens` mints that
 account's Google token and it is sealed in; without one, the token carries
 no Google token and the resource acts as itself. Removing the client,
-changing its service account or narrowing its scopes revokes its tokens at
-once.
+rotating its secret, changing its service account or narrowing its scopes
+revokes its tokens at once.
 
 **Verifying.** `Server.Verify` returns a `Principal`: subject, email, hd,
 client, scopes, expiry, whether it is a workload, and the sealed Google
@@ -347,20 +379,34 @@ Identity is their email with `google.sub` and `google.hd`, exactly as on
 Path A; a workload's is `client:<id>`. Both add `steward.client_id`,
 `steward.scope` and `steward.kind` (`user` or `workload`).
 `Server.Authenticator()` is the purser authenticator. Its verdict is
-`purser.AuthSourceOIDC`: the token is checked locally against the
-issuer's keys, audience and expiry included, and the person signed in with
-Google's OpenID Connect. purser has no source for an authorization
-server's own sealed token; a dedicated one would be a purser addition.
+`purser.AuthSourceOIDC` for every token, a person's or a workload's: the
+token is checked locally against the issuer's keys, audience and expiry
+included, as an OIDC token is. purser has no source for an authorization
+server's own sealed token, and a source is fixed per authenticator, so the
+verdict does not say whether a person is behind a request: services branch
+on `steward.kind` (or `Principal.Workload`), never on the source. A
+dedicated source would be a purser addition.
 
 **Differences from kode-gopher**, besides the generalizations (scopes,
 resource, Google scopes, optional workload service account, `Admitter`,
-pluggable replay cache and keys, slog): the refresh token's audience is
-checked against the configured resource; more than one `resource`
-parameter is refused;
-an authorization code is given back if sealing the tokens fails; a static
-client's redirect URIs are validated at load; the keys being unavailable
-is `server_error`, never `invalid_grant`; and the consent page's text is
-the service's (`ServiceName`).
+pluggable replay cache and keys, slog), most from this port's adversarial
+review and worth porting back: refresh-token families with reuse
+detection instead of one replay entry per refresh; refresh re-checks the
+grant's scopes against the configuration; a narrowing refresh does not
+narrow the grant; rotating a workload's secret revokes its tokens; an
+email change since sign-in forces a new sign-in; the refresh token's
+audience is checked against the configured resource; more than one
+`resource` parameter is refused; an authorization code is given back if
+sealing the tokens fails; custody failures that are Google failing are
+`server_error`, not `access_denied`; client-resolution errors (CIMD
+contents, dial errors) are not echoed; error descriptions keep to RFC
+6749's character set; the SSRF filter also refuses NAT64, 6to4, Teredo
+and other special-purpose ranges; flow cookies are `__Host-` where
+possible; client secrets are compared by digest; a static client's
+redirect URIs are validated at load and its slices copied; Google's
+endpoints must be https; the keys being unavailable is `server_error`,
+never `invalid_grant`; and the consent page's text is the service's
+(`ServiceName`).
 
 ## Hard rules
 

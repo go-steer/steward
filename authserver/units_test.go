@@ -19,6 +19,7 @@ package authserver
 
 import (
 	"context"
+	"crypto/rand"
 	"encoding/base64"
 	"encoding/json"
 	"errors"
@@ -390,15 +391,75 @@ func TestMemoryReplayCache(t *testing.T) {
 		t.Error("claim after expiry refused")
 	}
 	// Full of live claims: refuse rather than forget one.
-	for i := range maxMemoryClaims {
-		c.seen[fmt.Sprint(i)] = now.Add(time.Hour)
+	for i := range maxMemoryEntries {
+		c.codes[fmt.Sprint(i)] = now.Add(time.Hour)
 	}
 	if ok, err := c.Claim(ctx, "new", now.Add(time.Minute)); ok || !errors.Is(err, errReplayFull) {
 		t.Errorf("claim in a full cache: %v %v", ok, err)
 	}
 	now = now.Add(2 * time.Hour)
-	if ok, err := c.Claim(ctx, "new", now.Add(time.Minute)); !ok || err != nil || len(c.seen) != 1 {
-		t.Errorf("claim after the cache's claims expired: %v %v, %d left", ok, err, len(c.seen))
+	if ok, err := c.Claim(ctx, "new", now.Add(time.Minute)); !ok || err != nil || len(c.codes) != 1 {
+		t.Errorf("claim after the cache's claims expired: %v %v, %d left", ok, err, len(c.codes))
+	}
+}
+
+func TestMemoryReplayCacheFamilies(t *testing.T) {
+	t.Parallel()
+	c := NewMemoryReplayCache()
+	now := time.Unix(1_800_000_000, 0)
+	c.now = func() time.Time { return now }
+	ctx := context.Background()
+	exp := now.Add(time.Hour)
+	rotate := func(fam string, gen uint64) bool {
+		t.Helper()
+		ok, err := c.Rotate(ctx, fam, gen, exp)
+		if err != nil {
+			t.Fatal(err)
+		}
+		return ok
+	}
+	if !rotate("f", 0) || !rotate("f", 1) {
+		t.Fatal("rotating a fresh family refused")
+	}
+	// A later generation than known (another replica rotated it): moves on.
+	if !rotate("f", 5) {
+		t.Error("a later generation refused")
+	}
+	// Unrotate gives back the last rotation only.
+	_ = c.Unrotate(ctx, "f", 5)
+	if !rotate("f", 5) {
+		t.Error("rotation after Unrotate refused")
+	}
+	_ = c.Unrotate(ctx, "f", 2) // not the last rotation: no effect
+	// A generation the family has moved past is a replay: refused, and the
+	// whole family revoked.
+	if rotate("f", 3) {
+		t.Error("a replayed generation accepted")
+	}
+	if rotate("f", 6) {
+		t.Error("the current generation accepted after the family was revoked")
+	}
+	_ = c.Unrotate(ctx, "f", 5) // a revoked family stays revoked
+	if rotate("f", 6) {
+		t.Error("Unrotate revived a revoked family")
+	}
+	// Expired families are forgotten: an unknown family starts where the
+	// token says.
+	now = exp
+	if !rotate("f", 6) {
+		t.Error("an expired family still refused")
+	}
+	// Full of live families: refuse rather than forget one.
+	exp = now.Add(time.Hour)
+	for i := range maxMemoryEntries {
+		c.families[fmt.Sprint(i)] = family{gen: 1, exp: exp}
+	}
+	if ok, err := c.Rotate(ctx, "new", 0, exp); ok || !errors.Is(err, errReplayFull) {
+		t.Errorf("rotating in a full cache: %v %v", ok, err)
+	}
+	now = exp
+	if ok, err := c.Rotate(ctx, "new", 0, now.Add(time.Hour)); !ok || err != nil || len(c.families) != 1 {
+		t.Errorf("rotating after the families expired: %v %v, %d left", ok, err, len(c.families))
 	}
 }
 
@@ -409,6 +470,10 @@ func (failingReplay) Claim(context.Context, string, time.Time) (bool, error) {
 	return false, errors.New("store down")
 }
 func (failingReplay) Release(context.Context, string) error { return nil }
+func (failingReplay) Rotate(context.Context, string, uint64, time.Time) (bool, error) {
+	return false, errors.New("store down")
+}
+func (failingReplay) Unrotate(context.Context, string, uint64) error { return nil }
 
 func TestReplayCacheFailureIsServerError(t *testing.T) {
 	t.Parallel()
@@ -438,19 +503,29 @@ func (failingKeys) Keyring(context.Context) (*seal.Keyring, error) {
 // client's grant or token.
 func TestKeysUnavailable(t *testing.T) {
 	t.Parallel()
-	e := newTestEnv(t, true, nil)
-	id, first := e.signIn(newBrowser(t))
+	e := newTestEnv(t, true, func(c *Config) {
+		c.Clients = []StaticClient{{ID: "cli", RedirectURIs: []string{clientRedirect}}}
+	})
+	v := rand.Text() + rand.Text()
+	first := e.token(exchangeForm("cli", e.code("cli", v), v), "", "")
+	id := e.register()
 	e.as.cfg.Keys = failingKeys{}
 	if _, err := e.as.Verify(context.Background(), first.Access); !errors.Is(err, ErrUnavailable) || errors.Is(err, purser.ErrUnauthenticated) {
 		t.Errorf("Verify without keys: %v, want ErrUnavailable", err)
 	}
-	if r := e.token(refreshForm(id, first.Refresh), "", ""); r.Error != "server_error" {
+	// A static client resolves without the keys, so these reach the
+	// opening of the grant itself.
+	if r := e.token(refreshForm("cli", first.Refresh), "", ""); r.Error != "server_error" {
 		t.Errorf("refresh without keys: %+v", r)
 	}
-	if r := e.token(exchangeForm(id, "st1.k1.x", "v"), "", ""); r.Error != "server_error" {
+	if r := e.token(exchangeForm("cli", "st1.k1.x", v), "", ""); r.Error != "server_error" {
 		t.Errorf("exchange without keys: %+v", r)
 	}
-	resp, err := http.Post(e.srv.URL+"/register", "application/json", strings.NewReader(`{"redirect_uris":["`+clientRedirect+`"]}`))
+	// A DCR client cannot be resolved without them.
+	if r := e.token(exchangeForm(id, "st1.k1.x", v), "", ""); r.Error != "server_error" {
+		t.Errorf("DCR client without keys: %+v", r)
+	}
+	resp, err := hc.Post(e.srv.URL+"/register", "application/json", strings.NewReader(`{"redirect_uris":["`+clientRedirect+`"]}`))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -458,13 +533,13 @@ func TestKeysUnavailable(t *testing.T) {
 	if resp.StatusCode != http.StatusInternalServerError {
 		t.Errorf("register without keys: %d", resp.StatusCode)
 	}
-	resp, err = http.Get(e.authorizeURL(id, "v", nil))
+	resp, err = hc.Get(e.authorizeURL(id, "v", nil))
 	if err != nil {
 		t.Fatal(err)
 	}
 	_ = resp.Body.Close()
-	if resp.StatusCode != http.StatusBadRequest {
-		t.Errorf("authorize without keys (a DCR client cannot be resolved): %d", resp.StatusCode)
+	if resp.StatusCode != http.StatusServiceUnavailable {
+		t.Errorf("authorize without keys (a DCR client cannot be resolved): %d, want 503", resp.StatusCode)
 	}
 }
 
@@ -479,7 +554,7 @@ func TestRegister(t *testing.T) {
 		"token response":  `{"redirect_uris":["` + clientRedirect + `"],"response_types":["token"]}`,
 		"eleven redirect": `{"redirect_uris":[` + strings.Repeat(`"`+clientRedirect+`",`, 10) + `"` + clientRedirect + `"]}`,
 	} {
-		resp, err := http.Post(e.srv.URL+"/register", "application/json", strings.NewReader(body))
+		resp, err := hc.Post(e.srv.URL+"/register", "application/json", strings.NewReader(body))
 		if err != nil {
 			t.Fatal(err)
 		}
@@ -490,7 +565,7 @@ func TestRegister(t *testing.T) {
 			t.Errorf("%s: %d %v", name, resp.StatusCode, m)
 		}
 	}
-	resp, err := http.Post(e.srv.URL+"/register", "application/json", strings.NewReader(`{"client_name":"`+strings.Repeat("n", 300)+`","redirect_uris":["`+clientRedirect+`"],"token_endpoint_auth_method":"client_secret_basic"}`))
+	resp, err := hc.Post(e.srv.URL+"/register", "application/json", strings.NewReader(`{"client_name":"`+strings.Repeat("n", 300)+`","redirect_uris":["`+clientRedirect+`"],"token_endpoint_auth_method":"client_secret_basic"}`))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -621,17 +696,17 @@ func TestGoogleTokenEndpointErrors(t *testing.T) {
 		srv.Close()
 	}
 	g := &GoogleClient{TokenURL: "http://127.0.0.1:1", TokenInfoURL: "http://127.0.0.1:1"}
-	if _, err := g.refresh(context.Background(), http.DefaultClient, "r"); err == nil {
+	if _, err := g.refresh(context.Background(), hc, "r"); err == nil {
 		t.Error("unreachable token endpoint answered")
 	}
-	if _, err := g.tokenInfo(context.Background(), http.DefaultClient, "t"); err == nil {
+	if _, err := g.tokenInfo(context.Background(), hc, "t"); err == nil {
 		t.Error("unreachable tokeninfo answered")
 	}
 	bad := &GoogleClient{TokenURL: "http://\x7f", TokenInfoURL: "http://\x7f"}
-	if _, err := bad.refresh(context.Background(), http.DefaultClient, "r"); err == nil {
+	if _, err := bad.refresh(context.Background(), hc, "r"); err == nil {
 		t.Error("malformed token URL answered")
 	}
-	if _, err := bad.tokenInfo(context.Background(), http.DefaultClient, "t"); err == nil {
+	if _, err := bad.tokenInfo(context.Background(), hc, "t"); err == nil {
 		t.Error("malformed tokeninfo URL answered")
 	}
 }

@@ -84,8 +84,16 @@ type authError struct {
 func (s *Server) handleAuthorize(w http.ResponseWriter, r *http.Request) {
 	q := r.URL.Query()
 	c, err := s.resolveClient(r.Context(), q.Get("client_id"))
+	if clientUnavailable(err) {
+		s.log.WarnContext(r.Context(), "authserver: could not resolve a client at the authorization endpoint", "err", err)
+		s.authPage(w, http.StatusServiceUnavailable, "Try again", "Sign-in isn't available right now. Try again in a moment.")
+		return
+	}
 	if err != nil {
-		s.authPage(w, http.StatusBadRequest, "Unknown client", "This sign-in link names a client this server doesn't recognize: "+err.Error())
+		// The reason may quote a client-supplied metadata document or a
+		// dial error (an internal-network oracle): log it, show none of it.
+		s.log.InfoContext(r.Context(), "authserver: unknown client at the authorization endpoint", "err", err)
+		s.authPage(w, http.StatusBadRequest, "Unknown client", "This sign-in link names a client this server doesn't recognize.")
 		return
 	}
 	if c.static != nil && c.static.clientCredentials() {
@@ -214,7 +222,8 @@ func (s *Server) handleCallback(w http.ResponseWriter, r *http.Request) {
 		s.redirectError(w, r, req.RedirectURI, req.State, &authError{code, desc})
 	}
 	if e := q.Get("error"); e != "" {
-		fail("access_denied", "Google sign-in: "+e)
+		s.log.InfoContext(r.Context(), "authserver: Google sign-in returned an error", "error", e)
+		fail("access_denied", "Google sign-in was cancelled or refused")
 		return
 	}
 	ctx := r.Context()
@@ -233,7 +242,7 @@ func (s *Server) handleCallback(w http.ResponseWriter, r *http.Request) {
 	if err := s.cfg.Admit.Admit(ctx, u.Email, u.Domain); err != nil {
 		if errors.Is(err, allow.ErrNotAdmitted) {
 			s.log.InfoContext(ctx, "authserver: refused sign-in", "email", u.Email)
-			fail("access_denied", u.Email+" isn't allowed to use this server")
+			fail("access_denied", "this account isn't allowed to use this server")
 		} else {
 			s.log.WarnContext(ctx, "authserver: could not check the allow-list", "email", u.Email, "err", err)
 			fail("server_error", "couldn't check the allow-list")
@@ -243,7 +252,7 @@ func (s *Server) handleCallback(w http.ResponseWriter, r *http.Request) {
 	g, c, err := s.cfg.Custody.begin(ctx, s.google, u, t, s.ContinueURL())
 	if err != nil {
 		s.log.WarnContext(ctx, "authserver: custody failed at sign-in", "custody", s.cfg.Custody.Name(), "email", u.Email, "err", err)
-		fail("access_denied", grantFailed)
+		fail(custodyError(err), grantFailed)
 		return
 	}
 	if c != nil {
@@ -256,6 +265,17 @@ func (s *Server) handleCallback(w http.ResponseWriter, r *http.Request) {
 // grantFailed is what the client hears when custody fails; the reason
 // (which may quote Google's response) goes only to the log.
 const grantFailed = "couldn't get a Google grant for this account (the server log has details)"
+
+// custodyError is the OAuth error for a custody failure: access_denied for
+// a grant only the user can repair (declined consent, another account's
+// grant), server_error for Google or the vault failing, which a retry may
+// fix. Google failing is not Google refusing.
+func custodyError(err error) string {
+	if errors.Is(err, errReauth) {
+		return "access_denied"
+	}
+	return "server_error"
+}
 
 // toConsent parks the flow in a cookie and sends the browser to the
 // vault's consent leg, which returns to ContinueURL.
@@ -272,7 +292,7 @@ func (s *Server) toConsent(w http.ResponseWriter, r *http.Request, req *authRequ
 
 // handleConsentContinue is where the vault's consent leg returns.
 func (s *Server) handleConsentContinue(w http.ResponseWriter, r *http.Request) {
-	ck, err := r.Cookie(cookieConsent)
+	ck, err := r.Cookie(s.cookieName(cookieConsent))
 	var p pendingConsent
 	if err != nil || s.open(r.Context(), purposePending, ck.Value, &p) != nil || s.now().Unix() > p.Exp {
 		s.authPage(w, http.StatusBadRequest, "Sign-in expired", "This consent has expired or was started in another browser. Start again from your client.")
@@ -282,7 +302,7 @@ func (s *Server) handleConsentContinue(w http.ResponseWriter, r *http.Request) {
 	g, err := s.cfg.Custody.finish(r.Context(), s.google, p.User, p.Consent, r.URL.Query(), s.ContinueURL())
 	if err != nil {
 		s.log.WarnContext(r.Context(), "authserver: custody failed at consent", "custody", s.cfg.Custody.Name(), "email", p.User.Email, "err", err)
-		s.redirectError(w, r, p.Req.RedirectURI, p.Req.State, &authError{"access_denied", grantFailed})
+		s.redirectError(w, r, p.Req.RedirectURI, p.Req.State, &authError{custodyError(err), grantFailed})
 		return
 	}
 	s.finishAuthorize(w, r, &p.Req, p.User, g)
@@ -324,7 +344,7 @@ func (s *Server) bindBrowser(w http.ResponseWriter) string {
 }
 
 func (s *Server) sameBrowser(r *http.Request, want string) bool {
-	ck, err := r.Cookie(cookieBrowser)
+	ck, err := r.Cookie(s.cookieName(cookieBrowser))
 	if err != nil {
 		return false
 	}
@@ -343,11 +363,20 @@ func (s *Server) cookiePath() string {
 	return s.issuer.Path + "/"
 }
 
+// cookieName prefixes a flow cookie with __Host- where the browser allows
+// it (https, Path=/), so a sibling subdomain cannot set or shadow it.
+func (s *Server) cookieName(base string) string {
+	if s.issuer.Scheme == "https" && s.issuer.Path == "" {
+		return "__Host-" + base
+	}
+	return base
+}
+
 // setCookie sets a flow cookie. SameSite=Lax: it must ride the top-level
 // redirects back from Google.
 func (s *Server) setCookie(w http.ResponseWriter, name, value string) {
 	http.SetCookie(w, &http.Cookie{ //nolint:gosec // G124: Secure whenever the issuer is https; http only on loopback
-		Name: name, Value: value, Path: s.cookiePath(),
+		Name: s.cookieName(name), Value: value, Path: s.cookiePath(),
 		MaxAge:   int(AuthRequestTTL.Seconds()),
 		HttpOnly: true, Secure: s.issuer.Scheme == "https",
 		SameSite: http.SameSiteLaxMode,
@@ -356,14 +385,14 @@ func (s *Server) setCookie(w http.ResponseWriter, name, value string) {
 
 func (s *Server) clearCookie(w http.ResponseWriter, name string) {
 	http.SetCookie(w, &http.Cookie{ //nolint:gosec // G124: as setCookie
-		Name: name, Value: "", Path: s.cookiePath(), MaxAge: -1,
+		Name: s.cookieName(name), Value: "", Path: s.cookiePath(), MaxAge: -1,
 		HttpOnly: true, Secure: s.issuer.Scheme == "https",
 		SameSite: http.SameSiteLaxMode,
 	})
 }
 
 func (s *Server) redirectError(w http.ResponseWriter, r *http.Request, redirectURI, state string, e *authError) {
-	v := url.Values{"error": {e.code}, "error_description": {e.desc}, "iss": {s.cfg.Issuer}}
+	v := url.Values{"error": {e.code}, "error_description": {cleanDesc(e.desc)}, "iss": {s.cfg.Issuer}}
 	if state != "" {
 		v.Set("state", state)
 	}

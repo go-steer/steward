@@ -44,4 +44,4 @@ github.com/go-steer/steward/seal/secretmanager 100.0
 # a code, a state or a token fails after its inputs were checked (a keyring
 # that worked a moment earlier), and request-construction errors on
 # operator-configured endpoints.
-github.com/go-steer/steward/authserver         93.5  # 94.5
+github.com/go-steer/steward/authserver         95.0  # 96.1

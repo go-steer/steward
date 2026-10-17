@@ -16,6 +16,9 @@ package authserver
 
 import (
 	"context"
+	"crypto/sha256"
+	"crypto/subtle"
+	"encoding/base64"
 	"net/http"
 	"slices"
 	"strings"
@@ -44,33 +47,19 @@ func (s *Server) clientCredentials(r *http.Request, c *client) (map[string]any, 
 	if c.static == nil || !c.static.clientCredentials() || c.Secret == "" {
 		return nil, &tokenError{Code: "unauthorized_client", Desc: "this client may not use the client_credentials grant"}
 	}
-	allowed := s.allowedScopes(c)
-	var granted []string
-	for _, sc := range strings.Fields(f.Get("scope")) {
-		if !slices.Contains(allowed, sc) {
-			return nil, &tokenError{Code: "invalid_scope", Desc: "scope " + sc + " isn't available to this client"}
-		}
-		if !slices.Contains(granted, sc) {
-			granted = append(granted, sc)
-		}
-	}
-	if len(granted) == 0 {
-		for _, sc := range s.defaultScopes {
-			if slices.Contains(allowed, sc) {
-				granted = append(granted, sc)
-			}
-		}
-	}
-	if len(granted) == 0 {
+	// As for an authorization request: scopes the client may not have are
+	// dropped (RFC 6749 section 3.3), since MCP clients ask for everything
+	// the resource advertises; the response says what was granted.
+	scope, ok := s.grantScopes(strings.Fields(f.Get("scope")), s.allowedScopes(c))
+	if !ok {
 		return nil, &tokenError{Code: "invalid_scope", Desc: "no scope is available to this client"}
 	}
 	if res := f.Get("resource"); (res != "" && res != s.cfg.Resource) || len(f["resource"]) > 1 {
 		return nil, &tokenError{Code: "invalid_target", Desc: "resource must be " + s.cfg.Resource}
 	}
-	scope := strings.Join(granted, " ")
 	p := accessPayload{
 		Sub: WorkloadSubject(c.ID), ClientID: c.ID, Aud: s.cfg.Resource, Scope: scope,
-		Mode: modeWorkload, SA: c.static.ServiceAccount,
+		Mode: modeWorkload, SA: c.static.ServiceAccount, SH: secretTag(c.Secret),
 	}
 	if sa := c.static.ServiceAccount; sa != "" {
 		tok, err := s.cfg.ServiceTokens.Token(ctx, sa)
@@ -101,12 +90,20 @@ func (s *Server) clientCredentials(r *http.Request, c *client) (map[string]any, 
 // keeps it apart from Google subs, which are numeric, and from emails.
 func WorkloadSubject(clientID string) string { return "client:" + clientID }
 
+// secretTag is a short digest of a client secret, sealed into a workload's
+// tokens (inside the envelope, so it is never visible to the client).
+func secretTag(secret string) string {
+	sum := sha256.Sum256([]byte("steward-client-secret/" + secret))
+	return base64.RawURLEncoding.EncodeToString(sum[:9])
+}
+
 // workloadCurrent reports whether a client-credentials token still matches
-// the configuration: removing the client, changing its service account, or
-// narrowing its scopes revokes its tokens at once.
+// the configuration: removing the client, rotating its secret, changing its
+// service account, or narrowing its scopes revokes its tokens at once.
 func (s *Server) workloadCurrent(p *accessPayload) bool {
 	c, ok := s.static[p.ClientID]
-	if !ok || !c.clientCredentials() || c.ServiceAccount != p.SA || p.Sub != WorkloadSubject(c.ID) {
+	if !ok || !c.clientCredentials() || c.ServiceAccount != p.SA || p.Sub != WorkloadSubject(c.ID) ||
+		subtle.ConstantTimeCompare([]byte(secretTag(c.Secret)), []byte(p.SH)) != 1 {
 		return false
 	}
 	allowed := s.allowedScopes(&client{static: &c})

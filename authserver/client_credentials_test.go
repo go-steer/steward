@@ -139,18 +139,34 @@ func TestClientCredentialsToken(t *testing.T) {
 		status       int
 		wantErrorFor string
 	}{
-		"wrong secret":     {ccForm(nil), "ci", "nope", http.StatusUnauthorized, "invalid_client"},
-		"no secret":        {ccForm(map[string]string{"client_id": "ci"}), "", "", http.StatusUnauthorized, "invalid_client"},
-		"user client":      {ccForm(nil), "cli", "cli-secret", http.StatusBadRequest, "unauthorized_client"},
-		"public client":    {ccForm(map[string]string{"client_id": e.register()}), "", "", http.StatusBadRequest, "unauthorized_client"},
-		"other scope":      {ccForm(map[string]string{"scope": "openid"}), "ci", "ci-secret", http.StatusBadRequest, "invalid_scope"},
-		"beyond its scope": {ccForm(map[string]string{"scope": scopeWrite}), "reader", "reader-secret", http.StatusBadRequest, "invalid_scope"},
-		"other resource":   {ccForm(map[string]string{"resource": "https://elsewhere.example/mcp"}), "ci", "ci-secret", http.StatusBadRequest, "invalid_target"},
+		"wrong secret":   {ccForm(nil), "ci", "nope", http.StatusUnauthorized, "invalid_client"},
+		"no secret":      {ccForm(map[string]string{"client_id": "ci"}), "", "", http.StatusUnauthorized, "invalid_client"},
+		"user client":    {ccForm(nil), "cli", "cli-secret", http.StatusBadRequest, "unauthorized_client"},
+		"public client":  {ccForm(map[string]string{"client_id": e.register()}), "", "", http.StatusBadRequest, "unauthorized_client"},
+		"other resource": {ccForm(map[string]string{"resource": "https://elsewhere.example/mcp"}), "ci", "ci-secret", http.StatusBadRequest, "invalid_target"},
+		"two resources":  {url.Values{"grant_type": {"client_credentials"}, "resource": {e.as.Resource(), e.as.Resource()}}, "ci", "ci-secret", http.StatusBadRequest, "invalid_target"},
 	} {
 		r := e.token(tc.form, tc.id, tc.secret)
 		if r.status != tc.status || r.Error != tc.wantErrorFor || r.Access != "" {
 			t.Errorf("%s: %d %q, want %d %q", name, r.status, r.Error, tc.status, tc.wantErrorFor)
 		}
+	}
+
+	// Scopes the client may not have are dropped, not refused (the MCP
+	// SDK's client asks for everything advertised); unknown ones too.
+	for name, tc := range map[string]struct {
+		id, secret, scope, want string
+	}{
+		"beyond its scope": {"reader", "reader-secret", scopeRead + " " + scopeWrite, scopeRead},
+		"unknown scope":    {"ci", "ci-secret", "openid", scopeRead},
+	} {
+		r := e.token(ccForm(map[string]string{"scope": tc.scope}), tc.id, tc.secret)
+		if r.status != http.StatusOK || r.Scope != tc.want {
+			t.Errorf("%s: %d %q %q, want scope %q", name, r.status, r.Error, r.Scope, tc.want)
+		}
+	}
+	if r := e.token(ccForm(map[string]string{"scope": scopeWrite}), "reader", "reader-secret"); r.status != http.StatusOK || r.Scope != scopeRead {
+		t.Errorf("only a scope beyond the client's: %+v, want its default", r)
 	}
 }
 
@@ -211,7 +227,7 @@ func TestClientCredentialsNoSignIn(t *testing.T) {
 		t.Errorf("authorization request for a client-credentials client: redirect %v", loc)
 	}
 	var m map[string]any
-	resp, err := http.Get(e.srv.URL + "/.well-known/oauth-authorization-server")
+	resp, err := hc.Get(e.srv.URL + "/.well-known/oauth-authorization-server")
 	if err != nil {
 		t.Fatal(err)
 	}

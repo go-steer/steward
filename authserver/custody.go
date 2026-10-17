@@ -104,10 +104,10 @@ func (SealedCustody) signInOffline() bool { return true }
 func (SealedCustody) begin(_ context.Context, g *upstream, _ User, t *googleTokens, _ string) (*grant, *consent, error) {
 	granted := strings.Fields(t.Scope)
 	if !g.hasScopes(granted) {
-		return nil, nil, errors.New("not every Google scope was granted at consent")
+		return nil, nil, reauthError("not every Google scope was granted at consent")
 	}
 	if t.RefreshToken == "" {
-		return nil, nil, errors.New("google returned no refresh token")
+		return nil, nil, reauthError("google returned no refresh token")
 	}
 	return &grant{AccessToken: t.AccessToken, Expiry: t.expiry, Scopes: granted, Secret: t.RefreshToken}, nil, nil
 }
@@ -116,7 +116,7 @@ func (SealedCustody) finish(context.Context, *upstream, User, consent, url.Value
 	return nil, errors.New("sealed custody has no consent detour")
 }
 
-func (SealedCustody) refresh(ctx context.Context, g *upstream, _ User, secret, _ string) (*grant, error) {
+func (SealedCustody) refresh(ctx context.Context, g *upstream, u User, secret, _ string) (*grant, error) {
 	if secret == "" {
 		return nil, errReauth
 	}
@@ -126,6 +126,14 @@ func (SealedCustody) refresh(ctx context.Context, g *upstream, _ User, secret, _
 	}
 	if err != nil {
 		return nil, err
+	}
+	// Google includes a fresh ID token when it can. If the account's email
+	// has changed since sign-in, the identity (and admission) sealed in the
+	// refresh token is stale: sign in again.
+	if t.IDToken != "" {
+		if now, err := g.client.verifyIDToken(t.IDToken, time.Now()); err == nil && (now.Sub != u.Sub || now.Email != u.Email) {
+			return nil, reauthError("the Google account's identity changed since sign-in")
+		}
 	}
 	granted := strings.Fields(t.Scope)
 	if t.Scope != "" && !g.hasScopes(granted) {
@@ -242,6 +250,11 @@ func (v *VaultCustody) grant(ctx context.Context, g *upstream, u User, r *vaultR
 		}
 		if !g.hasScopes(ti.Scopes) {
 			return nil, reauthError("vault: token lacks a configured Google scope")
+		}
+		if ti.Email != "" && !strings.EqualFold(ti.Email, u.Email) {
+			// Same account, new address: the identity (and admission)
+			// sealed at sign-in is stale.
+			return nil, reauthError("vault: the Google account's email changed since sign-in")
 		}
 		if time.Until(ti.Expiry) >= minGoogleTokenLife {
 			return &grant{AccessToken: tok, Expiry: ti.Expiry, Scopes: ti.Scopes}, nil

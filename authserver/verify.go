@@ -28,6 +28,7 @@ import (
 	"github.com/go-steer/purser"
 	"github.com/go-steer/purser/authn"
 
+	"github.com/go-steer/steward/googletoken"
 	"github.com/go-steer/steward/seal"
 )
 
@@ -44,10 +45,10 @@ var ErrUnavailable = errors.New("authserver: tokens cannot be verified right now
 const (
 	// LabelSubject is Google's stable account ID (sub) for a person; the
 	// same label googletoken sets for Path A.
-	LabelSubject = "google.sub"
+	LabelSubject = googletoken.LabelSubject
 	// LabelHD is a person's Workspace domain, absent for a consumer
 	// account; the same label googletoken sets for Path A.
-	LabelHD = "google.hd"
+	LabelHD = googletoken.LabelHD
 	// LabelClientID is the OAuth client the token was issued to.
 	LabelClientID = "steward.client_id"
 	// LabelScope is the token's granted service scopes, space-separated.
@@ -161,11 +162,23 @@ func (s *Server) Verify(ctx context.Context, token string) (Principal, error) {
 	case !workload && (p.Mode != "" || p.Email == "" || p.Token == ""):
 		return Principal{}, ErrInvalidToken
 	}
+	// A person's token keeps only the scopes the configuration still allows
+	// its client (a workload's was refused above if it has any other).
+	allowed := s.scopes
+	if c, ok := s.static[p.ClientID]; ok {
+		allowed = s.allowedScopes(&client{static: &c})
+	}
+	var scopes []string
+	for _, sc := range strings.Fields(p.Scope) {
+		if slices.Contains(allowed, sc) {
+			scopes = append(scopes, sc)
+		}
+	}
 	pr := Principal{
 		Subject:        p.Sub,
 		HD:             p.HD,
 		ClientID:       p.ClientID,
-		Scopes:         strings.Fields(p.Scope),
+		Scopes:         scopes,
 		Expiry:         exp,
 		Workload:       workload,
 		ServiceAccount: p.SA,
@@ -182,16 +195,17 @@ func (s *Server) Verify(ctx context.Context, token string) (Principal, error) {
 
 // Authenticator returns a purser authn.Authenticator for this server's
 // access tokens presented as "Authorization: Bearer <token>". Use it with
-// httpmw.CallerOptions{Enforce: true} and no Fallback, as for Path A; or
-// use httpauth's Protector, which accepts both kinds of token.
+// httpmw.CallerOptions{Enforce: true} and no Fallback, as for Path A.
 func (s *Server) Authenticator() *Authenticator { return &Authenticator{s: s} }
 
 // Authenticator is a purser authenticator for access tokens. Its verdict
-// is purser.AuthSourceOIDC: the token is verified locally against the
-// issuer's keys, audience and expiry included, and the person behind it
-// signed in with Google's OpenID Connect. (purser has no source for
-// "an authorization server's own sealed token"; OIDC is the nearest that
-// is true.)
+// is purser.AuthSourceOIDC for every token, a person's or a workload's:
+// the token is verified locally against the issuer's keys, audience and
+// expiry included, as an OIDC token is. (purser has no source for "an
+// authorization server's own sealed token"; OIDC is the nearest that is
+// true, and a source is fixed per authenticator.) The verdict does not say
+// whether a person is behind the request: branch on the Caller's
+// LabelKind, or Principal.Workload, never on the source.
 type Authenticator struct{ s *Server }
 
 var (

@@ -26,6 +26,7 @@ import (
 	"io"
 	"net/http"
 	"net/url"
+	"regexp"
 	"slices"
 	"strings"
 	"time"
@@ -63,17 +64,22 @@ type accessPayload struct {
 	Mode string `json:"m,omitempty"`
 	// SA is a workload's service account, if it has one.
 	SA string `json:"sa,omitempty"`
+	// SH is a tag of the workload's client secret, so rotating the secret
+	// revokes the tokens minted with the old one.
+	SH string `json:"sh,omitempty"`
 }
 
 // refreshPayload is a sealed refresh token. Secret is the Google refresh
-// token under sealed custody, empty under the vault.
+// token under sealed custody, empty under the vault. Family and Gen place
+// it in its rotation chain (see ReplayCache).
 type refreshPayload struct {
 	User     User   `json:"u"`
 	ClientID string `json:"c"`
 	Aud      string `json:"aud"`
 	Scope    string `json:"s"`
 	Secret   string `json:"g,omitempty"`
-	JTI      string `json:"j"`
+	Family   string `json:"f"`
+	Gen      uint64 `json:"n,omitempty"`
 	Exp      int64  `json:"e"`
 }
 
@@ -81,8 +87,6 @@ type refreshPayload struct {
 type tokenError struct {
 	Code string `json:"error"`
 	Desc string `json:"error_description,omitempty"`
-	// basic: the client tried HTTP Basic, so a 401 names that scheme.
-	basic bool
 }
 
 func invalidGrant(desc string) *tokenError { return &tokenError{Code: "invalid_grant", Desc: desc} }
@@ -106,8 +110,16 @@ func (s *Server) handleToken(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	r.Body = http.MaxBytesReader(w, r.Body, 64<<10)
+	if ct, _, _ := strings.Cut(r.Header.Get("Content-Type"), ";"); !strings.EqualFold(strings.TrimSpace(ct), "application/x-www-form-urlencoded") {
+		writeTokenError(w, &tokenError{Code: "invalid_request", Desc: "the body must be application/x-www-form-urlencoded"})
+		return
+	}
 	if err := r.ParseForm(); err != nil {
 		writeTokenError(w, &tokenError{Code: "invalid_request", Desc: "malformed form body"})
+		return
+	}
+	if r.PostForm.Get("grant_type") == "" {
+		writeTokenError(w, &tokenError{Code: "invalid_request", Desc: "grant_type is required"})
 		return
 	}
 	c, terr := s.authenticateClient(r)
@@ -144,19 +156,30 @@ func (s *Server) authenticateClient(r *http.Request) (*client, *tokenError) {
 		id, secret = r.PostForm.Get("client_id"), r.PostForm.Get("client_secret")
 	}
 	if id == "" {
-		return nil, &tokenError{Code: "invalid_client", Desc: "client_id is required", basic: basic}
+		return nil, &tokenError{Code: "invalid_client", Desc: "client_id is required"}
 	}
 	c, err := s.resolveClient(r.Context(), id)
-	if errors.Is(err, errKeys) {
-		return nil, serverError("the sealing keys are unavailable")
+	if clientUnavailable(err) {
+		s.log.WarnContext(r.Context(), "authserver: could not resolve a client at the token endpoint", "err", err)
+		return nil, serverError("the client couldn't be resolved right now")
 	}
 	if err != nil {
-		return nil, &tokenError{Code: "invalid_client", Desc: err.Error(), basic: basic}
+		// The reason may quote a client-supplied metadata document or a
+		// dial error: it goes to the log, not to the caller.
+		s.log.InfoContext(r.Context(), "authserver: unknown client at the token endpoint", "err", err)
+		return nil, &tokenError{Code: "invalid_client", Desc: "unknown client"}
 	}
-	if c.Secret != "" && subtle.ConstantTimeCompare([]byte(secret), []byte(c.Secret)) != 1 {
-		return nil, &tokenError{Code: "invalid_client", Desc: "client authentication failed", basic: basic}
+	if c.Secret != "" && !secretMatches(secret, c.Secret) {
+		return nil, &tokenError{Code: "invalid_client", Desc: "client authentication failed"}
 	}
 	return c, nil
+}
+
+// secretMatches compares digests in constant time, so neither the content
+// nor the length of the secret leaks through timing.
+func secretMatches(got, want string) bool {
+	g, w := sha256.Sum256([]byte(got)), sha256.Sum256([]byte(want))
+	return subtle.ConstantTimeCompare(g[:], w[:]) == 1
 }
 
 func formUnescape(s string) string {
@@ -182,7 +205,7 @@ func (s *Server) exchangeCode(r *http.Request, c *client) (map[string]any, *toke
 		return nil, invalidGrant("redirect_uri doesn't match the authorization request")
 	case !pkceMatches(f.Get("code_verifier"), p.Req.Challenge):
 		return nil, invalidGrant("PKCE verification failed")
-	case f.Get("resource") != "" && f.Get("resource") != p.Req.Resource:
+	case (f.Get("resource") != "" && f.Get("resource") != p.Req.Resource) || len(f["resource"]) > 1:
 		return nil, &tokenError{Code: "invalid_target", Desc: "resource doesn't match the authorization request"}
 	}
 	fresh, err := s.used.Claim(ctx, "code:"+p.JTI, time.Unix(p.Exp, 0))
@@ -195,7 +218,7 @@ func (s *Server) exchangeCode(r *http.Request, c *client) (map[string]any, *toke
 		return nil, invalidGrant("authorization code already used")
 	}
 	g := &grant{AccessToken: p.Token, Expiry: time.Unix(p.TokenExp, 0), Scopes: strings.Fields(p.GoogleScope), Secret: p.Secret}
-	resp, terr := s.issueTokens(ctx, p.User, c.ID, p.Req.Resource, p.Req.Scope, g)
+	resp, terr := s.issueTokens(ctx, p.User, c.ID, p.Req.Resource, p.Req.Scope, p.Req.Scope, rand.Text(), 0, g)
 	if terr != nil {
 		// Nothing was handed out: let the client try the code again.
 		_ = s.used.Release(ctx, "code:"+p.JTI)
@@ -203,8 +226,11 @@ func (s *Server) exchangeCode(r *http.Request, c *client) (map[string]any, *toke
 	return resp, terr
 }
 
+// verifierRE is RFC 7636 section 4.1: 43 to 128 unreserved characters.
+var verifierRE = regexp.MustCompile(`^[A-Za-z0-9._~-]{43,128}$`)
+
 func pkceMatches(verifier, challenge string) bool {
-	if len(verifier) < 43 || len(verifier) > 128 {
+	if !verifierRE.MatchString(verifier) {
 		return false
 	}
 	sum := sha256.Sum256([]byte(verifier))
@@ -225,37 +251,54 @@ func (s *Server) refreshTokens(ctx context.Context, r *http.Request, c *client) 
 		return nil, invalidGrant("refresh token expired")
 	case p.ClientID != c.ID:
 		return nil, invalidGrant("refresh token was issued to another client")
-	case f.Get("resource") != "" && f.Get("resource") != p.Aud:
+	case (f.Get("resource") != "" && f.Get("resource") != p.Aud) || len(f["resource"]) > 1:
 		return nil, &tokenError{Code: "invalid_target", Desc: "resource doesn't match the original grant"}
 	case p.Aud != s.cfg.Resource:
 		return nil, invalidGrant("refresh token is for another resource")
 	}
-	scope := p.Scope
+	// The grant keeps only the scopes the configuration still allows this
+	// client: narrowing a client's (or the server's) scopes takes effect at
+	// its next refresh, not after the refresh token's 30-day life, which
+	// every refresh renews.
+	allowed := s.allowedScopes(c)
+	var kept []string
+	for _, sc := range strings.Fields(p.Scope) {
+		if slices.Contains(allowed, sc) {
+			kept = append(kept, sc)
+		}
+	}
+	if len(kept) == 0 {
+		return nil, invalidGrant("none of the granted scopes is available any more")
+	}
+	grantScope := strings.Join(kept, " ")
+	scope := grantScope
 	if req := strings.Fields(f.Get("scope")); len(req) > 0 {
-		// RFC 6749 section 6: a refresh may narrow the scope, never widen
-		// it.
-		narrowed, terr := narrowScope(req, strings.Fields(p.Scope))
+		// RFC 6749 section 6: a refresh may narrow the access token's
+		// scope, never widen it; the new refresh token keeps the grant's.
+		narrowed, terr := narrowScope(req, kept)
 		if terr != nil {
 			return nil, terr
 		}
 		scope = narrowed
 	}
-	id := "refresh:" + p.JTI
-	fresh, err := s.used.Claim(ctx, id, time.Unix(p.Exp, 0))
+	if p.Family == "" {
+		return nil, invalidGrant("invalid refresh token")
+	}
+	fresh, err := s.used.Rotate(ctx, p.Family, p.Gen, s.now().Add(RefreshTTL))
 	if err != nil {
 		s.log.ErrorContext(ctx, "authserver: replay cache", "err", err)
 		return nil, serverError("couldn't record the refresh token's use")
 	}
 	if !fresh {
-		s.log.WarnContext(ctx, "authserver: refresh token reused", "email", p.User.Email, "client", p.ClientID)
+		s.log.WarnContext(ctx, "authserver: refresh token reused; its family is revoked", "email", p.User.Email, "client", p.ClientID)
 		return nil, invalidGrant("refresh token already used")
 	}
-	// The token is claimed above, so two concurrent refreshes cannot both
-	// use it. A transient failure below (server_error) gives the claim
+	// The family is rotated above, so two concurrent refreshes cannot both
+	// use the token. A transient failure below (server_error) rotates it
 	// back, or the client's retry would be refused as a replay and its user
 	// signed out; a final refusal (invalid_grant: not allowed, or a grant
 	// only the user can restore, errReauth) keeps it spent.
-	release := func() { _ = s.used.Release(ctx, id) }
+	release := func() { _ = s.used.Unrotate(ctx, p.Family, p.Gen) }
 	if err := s.cfg.Admit.Admit(ctx, p.User.Email, p.User.Domain); err != nil {
 		if errors.Is(err, allow.ErrNotAdmitted) {
 			s.log.InfoContext(ctx, "authserver: refresh refused by the allow-list", "email", p.User.Email)
@@ -275,7 +318,7 @@ func (s *Server) refreshTokens(ctx context.Context, r *http.Request, c *client) 
 		release()
 		return nil, serverError("couldn't refresh the Google grant")
 	}
-	resp, terr := s.issueTokens(ctx, p.User, c.ID, p.Aud, scope, g)
+	resp, terr := s.issueTokens(ctx, p.User, c.ID, p.Aud, scope, grantScope, p.Family, p.Gen+1, g)
 	if terr != nil {
 		release()
 	}
@@ -287,7 +330,7 @@ func narrowScope(requested, granted []string) (string, *tokenError) {
 	var out []string
 	for _, sc := range requested {
 		if !slices.Contains(granted, sc) {
-			return "", &tokenError{Code: "invalid_scope", Desc: fmt.Sprintf("scope %q wasn't in the original grant", sc)}
+			return "", &tokenError{Code: "invalid_scope", Desc: "a requested scope wasn't in the original grant"}
 		}
 		if !slices.Contains(out, sc) {
 			out = append(out, sc)
@@ -296,9 +339,11 @@ func narrowScope(requested, granted []string) (string, *tokenError) {
 	return strings.Join(out, " "), nil
 }
 
-// issueTokens seals a new access and refresh token pair. The access token
+// issueTokens seals a new access and refresh token pair: the access token
+// with scope, the refresh token with grantScope (the same, unless a refresh
+// narrowed the access token) at generation gen of family. The access token
 // never outlives the Google token inside it.
-func (s *Server) issueTokens(ctx context.Context, u User, clientID, aud, scope string, g *grant) (map[string]any, *tokenError) {
+func (s *Server) issueTokens(ctx context.Context, u User, clientID, aud, scope, grantScope, family string, gen uint64, g *grant) (map[string]any, *tokenError) {
 	now := s.now()
 	at, exp, terr := s.sealAccess(ctx, accessPayload{
 		Sub: u.Sub, Email: u.Email, HD: u.Domain, ClientID: clientID, Aud: aud, Scope: scope,
@@ -308,8 +353,8 @@ func (s *Server) issueTokens(ctx context.Context, u User, clientID, aud, scope s
 		return nil, terr
 	}
 	rt, err := s.seal(ctx, purposeRefresh, refreshPayload{
-		User: u, ClientID: clientID, Aud: aud, Scope: scope, Secret: g.Secret,
-		JTI: rand.Text(), Exp: now.Add(RefreshTTL).Unix(),
+		User: u, ClientID: clientID, Aud: aud, Scope: grantScope, Secret: g.Secret,
+		Family: family, Gen: gen, Exp: now.Add(RefreshTTL).Unix(),
 	})
 	if err != nil {
 		s.log.ErrorContext(ctx, "authserver: seal refresh token", "err", err)
@@ -345,14 +390,30 @@ func (s *Server) sealAccess(ctx context.Context, p accessPayload, now time.Time)
 	return at, exp, nil
 }
 
+// cleanDesc keeps an error_description within RFC 6749's character set
+// (%x20-21 / %x23-5B / %x5D-7E), whatever client-supplied text it quotes.
+func cleanDesc(s string) string {
+	b := []byte(s)
+	for i, c := range b {
+		switch {
+		case c == '"':
+			b[i] = '\''
+		case c < 0x20 || c > 0x7e || c == '\\':
+			b[i] = '?'
+		}
+	}
+	return string(b)
+}
+
 func writeTokenError(w http.ResponseWriter, e *tokenError) {
+	e.Desc = cleanDesc(e.Desc)
 	code := http.StatusBadRequest
 	switch e.Code {
 	case "invalid_client":
+		// A 401 carries a challenge (RFC 9110 section 15.5.2), however the
+		// client tried to authenticate.
 		code = http.StatusUnauthorized
-		if e.basic {
-			w.Header().Set("WWW-Authenticate", `Basic realm="steward"`)
-		}
+		w.Header().Set("WWW-Authenticate", `Basic realm="steward"`)
 	case "server_error":
 		code = http.StatusInternalServerError
 	}
@@ -385,12 +446,10 @@ func (s *Server) handleRegister(w http.ResponseWriter, r *http.Request) {
 		if strings.HasPrefix(desc, "redirect") {
 			code = "invalid_redirect_uri"
 		}
-		writeJSON(w, http.StatusBadRequest, map[string]string{"error": code, "error_description": desc})
+		writeJSON(w, http.StatusBadRequest, map[string]string{"error": code, "error_description": cleanDesc(desc)})
 		return
 	}
-	if len(m.ClientName) > 100 {
-		m.ClientName = m.ClientName[:100]
-	}
+	m.ClientName = truncate(m.ClientName, maxClientName)
 	now := s.now()
 	id, err := s.seal(r.Context(), purposeClient, dcrClient{RedirectURIs: m.RedirectURIs, Name: m.ClientName, IssuedAt: now.Unix()})
 	if err != nil {
@@ -415,10 +474,16 @@ func checkRegistration(redirects, grants, responses []string) string {
 	if len(redirects) == 0 || len(redirects) > 10 {
 		return "redirect_uris needs 1 to 10 entries"
 	}
+	total := 0
 	for _, u := range redirects {
 		if len(u) > 2048 || !validRedirectURI(u) {
-			return fmt.Sprintf("redirect URI %q isn't allowed (https, loopback http, or a private-use scheme)", u)
+			return fmt.Sprintf("redirect URI %q isn't allowed (https, loopback http, or a private-use scheme)", truncate(u, 200))
 		}
+		total += len(u)
+	}
+	// The registration rides in the client_id, which rides in URLs.
+	if total > 2048 {
+		return "redirect_uris are too long together (2048 bytes at most)"
 	}
 	for _, g := range grants {
 		if g != "authorization_code" && g != "refresh_token" {

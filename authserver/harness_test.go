@@ -446,10 +446,15 @@ const clientRedirect = "http://127.0.0.1:1/callback"
 
 var hiddenRequestRE = regexp.MustCompile(`name="request" value="([^"]+)"`)
 
+// hc is the tests' HTTP client. It has its own transport: closing an
+// httptest.Server closes http.DefaultTransport's idle connections, which
+// breaks requests other parallel tests have in flight on it.
+var hc = &http.Client{Transport: &http.Transport{}}
+
 func newBrowser(t *testing.T) *browser {
 	jar, _ := cookiejar.New(nil)
 	b := &browser{t: t}
-	b.hc = &http.Client{Jar: jar, CheckRedirect: func(req *http.Request, _ []*http.Request) error {
+	b.hc = &http.Client{Jar: jar, Transport: &http.Transport{}, CheckRedirect: func(req *http.Request, _ []*http.Request) error {
 		if req.URL.Host == "127.0.0.1:1" {
 			return http.ErrUseLastResponse
 		}
@@ -499,7 +504,7 @@ func (e *testEnv) call(token string) (int, string, http.Header) {
 	if token != "" {
 		req.Header.Set("Authorization", "Bearer "+token)
 	}
-	resp, err := http.DefaultClient.Do(req)
+	resp, err := hc.Do(req)
 	if err != nil {
 		e.t.Fatal(err)
 	}

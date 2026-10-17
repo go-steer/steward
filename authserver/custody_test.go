@@ -180,11 +180,11 @@ func TestVaultCustodyEdges(t *testing.T) {
 		t.Errorf("short token force-refreshed: %+v %v %v", gr, err, sv.calls)
 	}
 
-	unreachable := &VaultCustody{AuthProvider: "projects/p/locations/l/authProviders/kg", Client: http.DefaultClient, Endpoint: "http://127.0.0.1:1/v1/"}
+	unreachable := &VaultCustody{AuthProvider: "projects/p/locations/l/authProviders/kg", Client: hc, Endpoint: "http://127.0.0.1:1/v1/"}
 	if _, err := unreachable.refresh(ctx, g, alice, "", ""); err == nil {
 		t.Error("an unreachable vault answered")
 	}
-	bad := &VaultCustody{AuthProvider: "x", Client: http.DefaultClient, Endpoint: "http://\x7f/"}
+	bad := &VaultCustody{AuthProvider: "x", Client: hc, Endpoint: "http://\x7f/"}
 	if _, err := bad.refresh(ctx, g, alice, "", ""); err == nil {
 		t.Error("a malformed vault endpoint answered")
 	}
