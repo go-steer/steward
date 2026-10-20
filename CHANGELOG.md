@@ -8,6 +8,30 @@ exported API" in [`CONTRIBUTING.md`](./CONTRIBUTING.md)).
 
 ## [Unreleased]
 
+### Added
+
+- `authserver.Config.RefreshReuseGrace`, `authserver.GraceReplayCache`
+  (`RotateGrace`), `authserver.RotateResult` and its constants, and
+  `MemoryReplayCache.RotateGrace`: the refresh-token reuse grace below.
+
+### Changed
+
+- **A refresh token presented twice at once no longer signs the person
+  out.** MCP clients whose processes share one token store (for example
+  two Claude Code processes) can refresh with the same token within
+  milliseconds; the second presentation used to revoke the whole family,
+  the first one's fresh tokens with it. Now, within
+  `authserver.Config.RefreshReuseGrace` (default 10 seconds, at most a
+  minute, negative for off) of a rotation, the generation just rotated
+  away is refused with `invalid_grant` without revoking the family, so the
+  winner's tokens stay valid and a client that re-reads its store finds
+  them. Nothing is ever issued for a rotated token; an older generation,
+  or the same one after the window, still revokes. A shared replay cache
+  gets the grace by implementing `GraceReplayCache`; one that does not
+  keeps revoking on every reuse. `MemoryReplayCache` implements it, so a
+  wrapper that embeds it and overrides `Rotate` must now override
+  `RotateGrace` too, or the server skips the override.
+
 ### Security
 
 - **A client's name can no longer disguise its client ID or redirect host

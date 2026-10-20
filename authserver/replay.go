@@ -32,7 +32,9 @@ import (
 // two holders of the token is not the client it was issued to, so the
 // family is revoked and every token in it refused, and the user signs in
 // again. Storage grows with live families (one per sign-in per client),
-// not with refreshes.
+// not with refreshes. A cache that also implements GraceReplayCache spares
+// the generation a family has only just moved away from: presented again
+// within a few seconds, it is refused without revoking the family.
 //
 // A shared implementation (for a service running several replicas) must:
 //
@@ -63,8 +65,61 @@ type ReplayCache interface {
 	Rotate(ctx context.Context, family string, gen uint64, exp time.Time) (bool, error)
 	// Unrotate moves family back from gen+1 to gen, leaving its exp, after
 	// a refresh that failed for a transient reason. It does nothing for a
-	// family that has moved on, been revoked, expired or is unknown.
+	// family that has moved on, been revoked, expired or is unknown. A
+	// GraceReplayCache also forgets the grace the undone rotation recorded.
 	Unrotate(ctx context.Context, family string, gen uint64) error
+}
+
+// RotateResult is a GraceReplayCache's answer to a refresh.
+type RotateResult int
+
+const (
+	// RotateRevoked refuses the refresh: the family was past the presented
+	// generation and is now revoked, or was revoked already. It is the zero
+	// value, so a result left unset refuses.
+	RotateRevoked RotateResult = iota
+	// RotateApplied moved the family to the next generation.
+	RotateApplied
+	// RotateRefused refuses the refresh and leaves the family as it is,
+	// not revoked: the presented generation is the one the family last
+	// moved away from, within that move's grace.
+	RotateRefused
+)
+
+// GraceReplayCache is a ReplayCache that tells a concurrent refresh from a
+// replay. Clients whose processes share one token store can present the
+// same refresh token twice within milliseconds; with Rotate alone the
+// second presentation revokes the family, and the first one's new token
+// with it. When Config.Replay implements GraceReplayCache, the server
+// calls RotateGrace instead of Rotate (unless Config.RefreshReuseGrace is
+// negative), and a second presentation within the grace is refused
+// without revoking, so the client can re-read its store and find the new
+// token. Nothing is ever issued for a rotated generation either way.
+//
+// A shared implementation keeps one more value per family, the grace
+// deadline of its last rotation, under the guarantees ReplayCache states:
+// checked and set atomically with the generation, kept until the
+// family's exp. Its Rotate neither records nor honours a grace.
+//
+// A wrapper that embeds a GraceReplayCache (a *MemoryReplayCache, say)
+// and overrides Rotate must override RotateGrace too, or the server calls
+// the embedded RotateGrace and skips the override.
+type GraceReplayCache interface {
+	ReplayCache
+	// RotateGrace is Rotate, except that:
+	//
+	//   - a rotation (to gen+1, from any starting point Rotate allows)
+	//     records graceUntil with the family;
+	//   - presenting gen when the family is at gen+1, before the graceUntil
+	//     that rotation recorded, is RotateRefused: the family is left as
+	//     it is, not revoked;
+	//   - any older generation, the same one at or after graceUntil, or any
+	//     generation of a revoked family, is RotateRevoked, and the family
+	//     is revoked as Rotate revokes it.
+	//
+	// graceUntil, like exp, is an absolute time from the server's clock;
+	// the zero time grants no grace. An error is reported as by Rotate.
+	RotateGrace(ctx context.Context, family string, gen uint64, exp, graceUntil time.Time) (RotateResult, error)
 }
 
 // maxMemoryEntries bounds each of the in-memory cache's two tables (an
@@ -97,14 +152,18 @@ type family struct {
 	gen     uint64
 	exp     time.Time
 	revoked bool
+	// grace is when the last rotation's grace runs out: until then,
+	// presenting gen-1 is refused without revoking the family.
+	grace time.Time
 }
 
-// NewMemoryReplayCache returns an empty in-memory ReplayCache.
+// NewMemoryReplayCache returns an empty in-memory ReplayCache. It is a
+// GraceReplayCache.
 func NewMemoryReplayCache() *MemoryReplayCache {
 	return &MemoryReplayCache{codes: map[string]time.Time{}, families: map[string]family{}, now: time.Now}
 }
 
-var _ ReplayCache = (*MemoryReplayCache)(nil)
+var _ GraceReplayCache = (*MemoryReplayCache)(nil)
 
 // errReplayFull is the in-memory cache refusing an entry it has no room
 // for: refusing is safe, forgetting an entry is not.
@@ -143,26 +202,44 @@ func (c *MemoryReplayCache) Release(_ context.Context, id string) error {
 	return nil
 }
 
-// Rotate implements ReplayCache.
+// Rotate implements ReplayCache. It grants no grace and honours none a
+// RotateGrace recorded: every reuse revokes, as ReplayCache states.
 func (c *MemoryReplayCache) Rotate(_ context.Context, fam string, gen uint64, exp time.Time) (bool, error) {
+	r, err := c.rotate(fam, gen, exp, time.Time{}, false)
+	return r == RotateApplied, err
+}
+
+// RotateGrace implements GraceReplayCache.
+func (c *MemoryReplayCache) RotateGrace(_ context.Context, fam string, gen uint64, exp, graceUntil time.Time) (RotateResult, error) {
+	return c.rotate(fam, gen, exp, graceUntil, true)
+}
+
+// rotate is Rotate, and with honourGrace RotateGrace.
+func (c *MemoryReplayCache) rotate(fam string, gen uint64, exp, graceUntil time.Time, honourGrace bool) (RotateResult, error) {
 	c.mu.Lock()
 	defer c.mu.Unlock()
 	now := c.now()
 	if f, ok := c.families[fam]; ok && now.Before(f.exp) {
 		if f.revoked {
-			return false, nil
+			return RotateRevoked, nil
 		}
 		if gen < f.gen {
+			if honourGrace && gen+1 == f.gen && now.Before(f.grace) {
+				// The generation the family has only just moved away
+				// from, most likely from a second process sharing the
+				// client's token store: refuse it, keep the family.
+				return RotateRefused, nil
+			}
 			// A generation the family has moved past: revoke.
 			f.revoked = true
 			c.families[fam] = f
-			return false, nil
+			return RotateRevoked, nil
 		}
 		// gen == f.gen, or a later generation: only another replica (or
 		// this one before a restart) can have minted it, since tokens are
 		// sealed, so move on.
-		c.families[fam] = family{gen: gen + 1, exp: exp}
-		return true, nil
+		c.families[fam] = family{gen: gen + 1, exp: exp, grace: graceUntil}
+		return RotateApplied, nil
 	}
 	if len(c.families) >= maxMemoryEntries {
 		if now.Sub(c.familiesSwept) >= sweepEvery {
@@ -174,11 +251,11 @@ func (c *MemoryReplayCache) Rotate(_ context.Context, fam string, gen uint64, ex
 			}
 		}
 		if len(c.families) >= maxMemoryEntries {
-			return false, errReplayFull
+			return RotateRevoked, errReplayFull
 		}
 	}
-	c.families[fam] = family{gen: gen + 1, exp: exp}
-	return true, nil
+	c.families[fam] = family{gen: gen + 1, exp: exp, grace: graceUntil}
+	return RotateApplied, nil
 }
 
 // Unrotate implements ReplayCache.
@@ -186,7 +263,9 @@ func (c *MemoryReplayCache) Unrotate(_ context.Context, fam string, gen uint64) 
 	c.mu.Lock()
 	defer c.mu.Unlock()
 	if f, ok := c.families[fam]; ok && !f.revoked && f.gen == gen+1 {
-		f.gen = gen
+		// The grace was the undone rotation's: gen-1 was rotated away
+		// before it, so presenting gen-1 is a replay again.
+		f.gen, f.grace = gen, time.Time{}
 		c.families[fam] = f
 	}
 	return nil

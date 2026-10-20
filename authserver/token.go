@@ -306,7 +306,7 @@ func (s *Server) refreshTokens(ctx context.Context, r *http.Request, c *client) 
 	release := func() {
 		s.undo(ctx, "give back a refresh rotation", func(ctx context.Context) error { return s.used.Unrotate(ctx, p.Family, p.Gen) })
 	}
-	fresh, err := s.used.Rotate(ctx, p.Family, p.Gen, exp)
+	rotated, err := s.rotate(ctx, p.Family, p.Gen, exp)
 	if err != nil {
 		s.log.ErrorContext(ctx, "authserver: replay cache", "err", err)
 		// The rotation may have been applied before the error (a
@@ -314,7 +314,14 @@ func (s *Server) refreshTokens(ctx context.Context, r *http.Request, c *client) 
 		release()
 		return nil, serverError("couldn't record the refresh token's use")
 	}
-	if !fresh {
+	switch rotated {
+	case RotateApplied:
+	case RotateRefused:
+		// Both refusals read the same to the client, so a thief cannot
+		// tell whether the family is still alive.
+		s.log.InfoContext(ctx, "authserver: refresh token presented again within the reuse grace; refused, family kept", "email", p.User.Email, "client", p.ClientID)
+		return nil, invalidGrant("refresh token already used")
+	default:
 		s.log.WarnContext(ctx, "authserver: refresh token reused; its family is revoked", "email", p.User.Email, "client", p.ClientID)
 		return nil, invalidGrant("refresh token already used")
 	}
@@ -347,6 +354,19 @@ func (s *Server) refreshTokens(ctx context.Context, r *http.Request, c *client) 
 		release()
 	}
 	return resp, terr
+}
+
+// rotate moves family on from gen through the replay cache, with the
+// reuse grace if the cache supports one.
+func (s *Server) rotate(ctx context.Context, family string, gen uint64, exp time.Time) (RotateResult, error) {
+	if g, ok := s.used.(GraceReplayCache); ok && s.grace > 0 {
+		return g.RotateGrace(ctx, family, gen, exp, s.now().Add(s.grace))
+	}
+	fresh, err := s.used.Rotate(ctx, family, gen, exp)
+	if fresh {
+		return RotateApplied, err
+	}
+	return RotateRevoked, err
 }
 
 // narrowScope checks that every requested scope was in the original grant.

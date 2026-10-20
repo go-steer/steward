@@ -81,6 +81,17 @@ const (
 	RefreshTTL = 30 * 24 * time.Hour
 )
 
+// Config.RefreshReuseGrace's default and limit. The default covers the
+// winner of a concurrent refresh getting from its rotation to writing the
+// new token back to the client's store: an admission check, a Google or
+// vault round trip or two, and the response. Every second of it is a
+// second in which a stolen token presented after the victim's refresh, or
+// the victim's after the thief's, is refused without revoking.
+const (
+	defaultRefreshReuseGrace = 10 * time.Second
+	maxRefreshReuseGrace     = time.Minute
+)
+
 // Envelope purposes, bound into each seal together with the issuer.
 const (
 	purposeClient  = "client"
@@ -170,6 +181,20 @@ type Config struct {
 	// once on each. Supply a shared one to close that.
 	Replay ReplayCache
 
+	// RefreshReuseGrace tolerates a refresh token presented again just
+	// after it was rotated, as clients whose processes share one token
+	// store present it when two of them refresh at once. Within it, the
+	// generation a family has just moved away from is refused
+	// (invalid_grant) without revoking the family, so the token the first
+	// refresh issued stays valid and the client can re-read it from its
+	// store. Any older generation, or the same one later, still revokes
+	// the family, and nothing is ever issued for a rotated token. Only a
+	// Replay that implements GraceReplayCache (the in-memory one does) can
+	// tell the difference; with any other, every reuse revokes. Zero means
+	// 10 seconds; negative turns the grace off. At most a minute: the
+	// window is time in which a stolen token's reuse is not detected.
+	RefreshReuseGrace time.Duration
+
 	// ServiceName names the service on the consent page. Empty means the
 	// issuer's host.
 	ServiceName string
@@ -200,6 +225,7 @@ type Server struct {
 	serviceClients bool
 	cimd           *cimdFetcher
 	used           ReplayCache
+	grace          time.Duration // RefreshReuseGrace resolved: zero for none
 	log            *slog.Logger
 	now            func() time.Time
 }
@@ -225,6 +251,8 @@ func New(cfg Config) (*Server, error) {
 		return nil, errors.New("authserver: New: a key provider is required")
 	case len(cfg.Scopes) == 0:
 		return nil, errors.New("authserver: New: at least one service scope is required")
+	case cfg.RefreshReuseGrace > maxRefreshReuseGrace:
+		return nil, fmt.Errorf("authserver: New: RefreshReuseGrace %v is over %v", cfg.RefreshReuseGrace, maxRefreshReuseGrace)
 	}
 	scopes, err := checkScopes("Scopes", cfg.Scopes, nil)
 	if err != nil {
@@ -282,6 +310,7 @@ func New(cfg Config) (*Server, error) {
 		static:        map[string]StaticClient{},
 		cimd:          newCIMDFetcher(cfg.CIMDClient),
 		used:          cfg.Replay,
+		grace:         max(cfg.RefreshReuseGrace, 0),
 		log:           cfg.Logger,
 		now:           time.Now,
 	}
@@ -289,6 +318,9 @@ func New(cfg Config) (*Server, error) {
 	s.google = &upstream{client: &s.cfg.Google, hc: s.cfg.HTTPClient, scopes: gscopes}
 	if s.used == nil {
 		s.used = NewMemoryReplayCache()
+	}
+	if cfg.RefreshReuseGrace == 0 {
+		s.grace = defaultRefreshReuseGrace
 	}
 	if s.log == nil {
 		s.log = slog.Default()
