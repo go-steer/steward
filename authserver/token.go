@@ -473,7 +473,7 @@ func (s *Server) handleRegister(w http.ResponseWriter, r *http.Request) {
 		writeJSON(w, http.StatusBadRequest, map[string]string{"error": code, "error_description": cleanDesc(desc)})
 		return
 	}
-	m.ClientName = truncate(m.ClientName, maxClientName)
+	m.ClientName = clientName(m.ClientName)
 	now := s.now()
 	id, err := s.seal(r.Context(), purposeClient, dcrClient{RedirectURIs: m.RedirectURIs, Name: m.ClientName, IssuedAt: now.Unix()})
 	if err != nil {

@@ -8,6 +8,26 @@ exported API" in [`CONTRIBUTING.md`](./CONTRIBUTING.md)).
 
 ## [Unreleased]
 
+### Security
+
+- **A client's name can no longer disguise its client ID or redirect host
+  on `authserver`'s consent page.** A DCR or CIMD `client_name` was shown
+  as `name (client_id)` in one element, so a name with a right-to-left
+  override or a bidi isolate could visually reverse the client ID and the
+  redirect host after it, and a short name could carry a fake
+  `(https://...)` of its own. Names are now cleaned at registration, at
+  resolution (covering registrations sealed before this release) and at
+  display: control and format characters, bidi controls, zero-width and
+  other default-ignorable, private-use and unassigned code points are
+  dropped, whitespace and newlines collapse to one space, stacked
+  combining marks are capped, and truncation to 100 bytes happens after
+  cleaning, on a character boundary. The page shows the name in its own
+  `<bdi>` element ("a client calling itself ..."), and the CIMD client ID
+  and redirect host each in an element of their own, percent-encoded to
+  printable ASCII; a DCR client gets a line saying nothing vouches for its
+  name, so a fake `(https://...)` reads as part of the claim.
+  `StaticClient.Name` is cleaned the same way in logs.
+
 ### Fixed
 
 - **A recreated allow-listed group no longer locks its members out for up
