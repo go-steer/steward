@@ -45,12 +45,16 @@ type graceEnv struct {
 	skew   *atomic.Int64 // nanoseconds the cache's clock runs ahead
 }
 
+// testGrace is the grace the tests turn on; by default there is none.
+const testGrace = 10 * time.Second
+
 func newGraceEnv(t *testing.T, mutate func(*Config)) *graceEnv {
 	t.Helper()
 	g := &graceEnv{replay: NewMemoryReplayCache(), skew: &atomic.Int64{}}
 	g.replay.now = func() time.Time { return time.Now().Add(time.Duration(g.skew.Load())) }
 	g.testEnv = newTestEnv(t, true, func(c *Config) {
 		c.Replay = g.replay
+		c.RefreshReuseGrace = testGrace
 		if mutate != nil {
 			mutate(c)
 		}
@@ -296,7 +300,7 @@ func TestRefreshReuseAfterGraceRevokes(t *testing.T) {
 	if r := e.token(refreshForm(id, first.Refresh), "", ""); r.Error != "invalid_grant" {
 		t.Errorf("reuse inside the grace: %+v, want invalid_grant", r)
 	}
-	e.skew.Store(int64(defaultRefreshReuseGrace + time.Second))
+	e.skew.Store(int64(testGrace + time.Second))
 	if r := e.token(refreshForm(id, first.Refresh), "", ""); r.Error != "invalid_grant" {
 		t.Errorf("reuse after the grace: %+v, want invalid_grant", r)
 	}
@@ -354,13 +358,16 @@ func TestRefreshGraceAcrossReplicas(t *testing.T) {
 // the interface, not the concrete cache, so RotateGrace is not promoted.
 type graceless struct{ ReplayCache }
 
-// A cache without GraceReplayCache gets no grace, and a negative
-// RefreshReuseGrace turns it off: every reuse revokes, as before.
+// A cache without GraceReplayCache gets no grace, and without
+// RefreshReuseGrace (the default) there is none: every reuse revokes.
 func TestRefreshWithoutGraceRevokes(t *testing.T) {
 	t.Parallel()
 	for name, mutate := range map[string]func(*Config){
-		"graceless cache": func(c *Config) { c.Replay = graceless{NewMemoryReplayCache()} },
-		"grace off":       func(c *Config) { c.RefreshReuseGrace = -1 },
+		"graceless cache": func(c *Config) {
+			c.Replay = graceless{NewMemoryReplayCache()}
+			c.RefreshReuseGrace = testGrace
+		},
+		"default, no grace": nil,
 	} {
 		t.Run(name, func(t *testing.T) {
 			t.Parallel()
@@ -417,13 +424,13 @@ func (f failAfter) IsMember(ctx context.Context, group, member string) (bool, er
 func TestRefreshReuseGraceConfig(t *testing.T) {
 	t.Parallel()
 	e := newTestEnv(t, true, nil)
-	if e.as.grace != defaultRefreshReuseGrace {
-		t.Errorf("default grace %v, want %v", e.as.grace, defaultRefreshReuseGrace)
+	if e.as.grace != 0 {
+		t.Errorf("default grace %v, want none", e.as.grace)
 	}
 	cfg := e.as.cfg
 	cfg.RefreshReuseGrace = -time.Second
-	if s, err := New(cfg); err != nil || s.grace != 0 {
-		t.Errorf("negative grace: err %v; want the grace off", err)
+	if _, err := New(cfg); err == nil || !strings.Contains(err.Error(), "RefreshReuseGrace") {
+		t.Errorf("negative grace: %v, want an error", err)
 	}
 	cfg.RefreshReuseGrace = 3 * time.Second
 	if s, err := New(cfg); err != nil || s.grace != 3*time.Second {

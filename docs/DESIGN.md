@@ -499,8 +499,9 @@ goroutines through a token source that does not serialize them) present
 the same refresh token twice within milliseconds when they refresh at
 once. Without a grace the second presentation revokes the
 family, the first one's fresh tokens with it, and the person is signed out
-of every process. So for `Config.RefreshReuseGrace` after a rotation
-(default 10 s), presenting exactly the generation the family has just
+of every process. So an operator can set `Config.RefreshReuseGrace` (off
+by default; 10 s is a reasonable value): for that long after a rotation,
+presenting exactly the generation the family has just
 moved away from is refused with `invalid_grant` but does not revoke the
 family: the winner's tokens stay valid, and a client with a shared store
 re-reads them. An older generation, the same one after the window, or any
@@ -541,13 +542,15 @@ family survived. The log tells them apart.
   the family, if the victim's client then signs in afresh rather than
   presenting the stale token again (which, after the window, revokes). A
   thief who cannot see the victim's schedule lands there with probability
-  about window ÷ refresh interval: with the default 10 s and 15-minute
+  about window ÷ refresh interval: with a 10 s grace and 15-minute
   access tokens, about 1 %. One who knows the victim's token expiry (it
   sits in the same store) can aim for it; the window bounds how precisely
-  they must aim, and no window short of zero removes it. The default
-  covers a winner's round trip from rotation to writing its store
-  (admission, one or two Google or vault calls, the response); the limit
-  is a minute, and a negative value turns the grace off.
+  they must aim, and no window short of zero removes it. That loss, and
+  the go-sdk client's limited benefit below, are why the grace is off by
+  default: an operator whose clients share a token store and see these
+  sign-outs turns it on. 10 s covers a winner's round trip from rotation
+  to writing its store (admission, one or two Google or vault calls, the
+  response); the limit is a minute, and a negative value is refused.
 - *Clients.* The grace helps a client that, refused, re-reads its store
   before trying again; it is for such clients that it exists. The go-sdk
   MCP client (v1.8.0) does not: its token source

@@ -32,9 +32,10 @@ import (
 // two holders of the token is not the client it was issued to, so the
 // family is revoked and every token in it refused, and the user signs in
 // again. Storage grows with live families (one per sign-in per client),
-// not with refreshes. A cache that also implements GraceReplayCache spares
-// the generation a family has only just moved away from: presented again
-// within a few seconds, it is refused without revoking the family.
+// not with refreshes. When Config.RefreshReuseGrace is set (by default it
+// is not), a cache that also implements GraceReplayCache spares the
+// generation a family has only just moved away from: presented again
+// within the grace, it is refused without revoking the family.
 //
 // A shared implementation (for a service running several replicas) must:
 //
@@ -91,10 +92,10 @@ const (
 // same refresh token twice within milliseconds; with Rotate alone the
 // second presentation revokes the family, and the first one's new token
 // with it. When Config.Replay implements GraceReplayCache, the server
-// calls RotateGrace instead of Rotate (unless Config.RefreshReuseGrace is
-// negative), and a second presentation within the grace is refused
-// without revoking, so the client can re-read its store and find the new
-// token. Nothing is ever issued for a rotated generation either way.
+// calls RotateGrace instead of Rotate (when Config.RefreshReuseGrace is
+// set; by default it is not), and a second presentation within the grace
+// is refused without revoking, so the client can re-read its store and
+// find the new token. Nothing is ever issued for a rotated generation either way.
 //
 // A shared implementation keeps one more value per family, the grace
 // deadline of its last rotation, under the guarantees ReplayCache states:

@@ -16,17 +16,20 @@ exported API" in [`CONTRIBUTING.md`](./CONTRIBUTING.md)).
 
 ### Changed
 
-- **A refresh token presented twice at once no longer signs the person
+- **A refresh token presented twice at once need not sign the person
   out.** MCP clients whose processes share one token store (for example
   two Claude Code processes) can refresh with the same token within
   milliseconds; the second presentation used to revoke the whole family,
-  the first one's fresh tokens with it. Now, within
-  `authserver.Config.RefreshReuseGrace` (default 10 seconds, at most a
-  minute, negative for off) of a rotation, the generation just rotated
-  away is refused with `invalid_grant` without revoking the family, so the
-  winner's tokens stay valid and a client that re-reads its store finds
-  them. Nothing is ever issued for a rotated token; an older generation,
-  or the same one after the window, still revokes. A shared replay cache
+  the first one's fresh tokens with it. An operator can now set
+  `authserver.Config.RefreshReuseGrace` (off by default, at most a
+  minute; 10 seconds is a reasonable value): for that long after a
+  rotation, the generation just rotated away is refused with
+  `invalid_grant` without revoking the family, so the winner's tokens stay
+  valid and a client that re-reads its store finds them. Nothing is ever issued for a rotated token; an older generation,
+  or the same one after the window, still revokes. It is off by default
+  because it weakens theft detection (a stolen token refreshed just before
+  the victim's next refresh goes unnoticed) and the go-sdk MCP client
+  mostly gets only a delayed sign-out from it. A shared replay cache
   gets the grace by implementing `GraceReplayCache`; one that does not
   keeps revoking on every reuse. `MemoryReplayCache` implements it, so a
   wrapper that embeds it and overrides `Rotate` must now override
@@ -51,6 +54,13 @@ exported API" in [`CONTRIBUTING.md`](./CONTRIBUTING.md)).
   printable ASCII; a DCR client gets a line saying nothing vouches for its
   name, so a fake `(https://...)` reads as part of the claim.
   `StaticClient.Name` is cleaned the same way in logs.
+- **`authserver`: flow cookies are `__Secure-` prefixed for an https
+  issuer with a path.** `__Host-` needs `Path=/`, so such an issuer's
+  cookies had no prefix and a network attacker could plant one over plain
+  http (absent HSTS). A sign-in in progress on such an issuer during the
+  upgrade fails once, since the cookie's name changes. Issuers at the root
+  of their host keep `__Host-`; see "Browser binding" in `docs/DESIGN.md`
+  for who can plant a binding cookie in each case.
 
 ### Fixed
 
@@ -120,16 +130,6 @@ exported API" in [`CONTRIBUTING.md`](./CONTRIBUTING.md)).
   Other tokeninfo failures stay `server_error`.
 - **`authserver`: a vault error that quotes a forced token back** has the
   token replaced before the error is logged.
-
-### Security
-
-- **`authserver`: flow cookies are `__Secure-` prefixed for an https
-  issuer with a path.** `__Host-` needs `Path=/`, so such an issuer's
-  cookies had no prefix and a network attacker could plant one over plain
-  http (absent HSTS). A sign-in in progress on such an issuer during the
-  upgrade fails once, since the cookie's name changes. Issuers at the root
-  of their host keep `__Host-`; see "Browser binding" in `docs/DESIGN.md`
-  for who can plant a binding cookie in each case.
 
 ## [0.3.0] - 2026-10-20
 
