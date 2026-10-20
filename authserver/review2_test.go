@@ -167,8 +167,8 @@ func TestTokenEndpointContentType(t *testing.T) {
 	}
 }
 
-// Setting, reading and clearing a flow cookie all use the same name, with
-// or without the __Host- prefix.
+// Setting, reading and clearing a flow cookie all use the same name,
+// __Host- or __Secure- prefixed.
 func TestCookieSetClearConsistent(t *testing.T) {
 	t.Parallel()
 	for _, issuer := range []string{"https://svc.example.com", "https://svc.example.com/oauth"} {

@@ -49,6 +49,31 @@ exported API" in [`CONTRIBUTING.md`](./CONTRIBUTING.md)).
   cached under the old name answers as the old group did for up to 5
   minutes, and a recreated nested group is still an error until its name
   expires.
+- **`authserver`: starting sign-in twice in one browser no longer fails
+  both.** Each `/authorize` replaced the browser's binding cookie, so an
+  earlier tab, a retry, or a copied link opened next to the client's own
+  tab ended on "Sign-in expired". The cookie is now kept across starts,
+  renewed when the user approves the consent page, and no longer cleared
+  by Google's callback. An issuer with a path still starts each sign-in
+  with a fresh cookie, because a sibling subdomain could plant one there
+  (see "Browser binding" in `docs/DESIGN.md`), so the fix applies to
+  issuers at the root of an https host and to loopback. Two sign-ins that
+  both reach the credential vault's own consent screen still collide;
+  finish one first. When a sign-in can't continue, the page and the log
+  (`step`, `reason`) now say why: the link is unreadable, it's more than
+  10 minutes old, this browser didn't start it, or this browser started a
+  different one. The sealing keys being unavailable is now a 503 page to
+  retry rather than "Sign-in expired". Ported from kode-gopher `fb8ea5e`.
+
+### Security
+
+- **`authserver`: flow cookies are `__Secure-` prefixed for an https
+  issuer with a path.** `__Host-` needs `Path=/`, so such an issuer's
+  cookies had no prefix and a network attacker could plant one over plain
+  http (absent HSTS). A sign-in in progress on such an issuer during the
+  upgrade fails once, since the cookie's name changes. Issuers at the root
+  of their host keep `__Host-`; see "Browser binding" in `docs/DESIGN.md`
+  for who can plant a binding cookie in each case.
 
 ## [0.3.0] - 2026-10-20
 

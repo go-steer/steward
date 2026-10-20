@@ -312,14 +312,55 @@ cached per `Cache-Control` up to an hour). A redirect, like an address the
 filter refuses, is an unknown client, never "unavailable". DCR and CIMD clients
 get a consent page naming the client and its redirect host before Google
 sign-in, because one Google client fronts them all; pre-registered clients
-skip it. The flow is bound to the browser by a random cookie (`__Host-`
-prefixed when the issuer allows it) whose hash rides in the sealed state,
-so neither the consent form nor Google's callback works in another
-browser. Redirect URIs match exactly, except a loopback redirect may use
-any port (RFC 8252). Why a client could not be resolved (a CIMD document's
-contents, a dial error naming an internal address) goes to the log only;
-a CIMD host that is down, or our keys being unavailable, is a 503 page or
-`server_error`, not "unknown client".
+skip it. The flow is bound to the browser by a random cookie whose hash
+rides in the sealed state, so neither the consent form nor Google's
+callback works in another browser (below). Redirect URIs match exactly,
+except a loopback redirect may use any port (RFC 8252). Why a client could
+not be resolved (a CIMD document's contents, a dial error naming an
+internal address) goes to the log only; a CIMD host that is down, or our
+keys being unavailable, is a 503 page or `server_error`, not "unknown
+client".
+
+**Browser binding.** `/authorize` sets `steward_auth` (HttpOnly,
+SameSite=Lax, the issuer's path, 10 minutes; on https Secure and named
+`__Host-steward_auth`, or `__Secure-steward_auth` for an issuer with a
+path, which `__Host-` forbids). Approving the consent page renews it and
+the callback leaves it alone. Where nobody else can plant the cookie (see
+below), a browser that already has a well-formed one (`rand.Text`'s
+alphabet and length) keeps it, so two sign-ins started in one browser (a
+retry, a copied link next to the client's tab, a prefetch) don't break
+each other. A refused flow says why, on the page and in the log (`step`,
+`reason`): the envelope is unreadable, it is more than 10 minutes old,
+the browser has no cookie, or it has another sign-in's. The keys being
+unavailable is a 503 page to retry, not a damaged link. A callback URL
+replayed in the same browser passes the binding now that the callback no
+longer clears the cookie; Google refuses the spent code, and the client
+gets `server_error`.
+
+Who can plant a binding cookie decides whether an existing one is kept.
+Anyone who can set a cookie for the issuer's path in a victim's browser
+defeats the binding either way: start a flow in their own browser, plant
+that browser's cookie value in the victim's, and send the victim the
+Google sign-in link. Keeping an existing cookie adds a second attack: a
+value the attacker planted earlier becomes the binding of the victim's
+own later flows, so a stolen Google `state` (it travels through Google,
+the URL bar and perhaps history sync) lets the attacker finish the
+victim's flow signed in as themselves, and hand the victim's client a code
+for the attacker's account, which the client redeems with its own PKCE
+verifier. A long-lived binding value also outlasts one seen in a log of
+`Cookie` headers. So the prefix decides who can plant, and that decides
+reuse:
+
+| Issuer | Cookie | Who can plant it | Existing cookie kept |
+|---|---|---|---|
+| https, at the root | `__Host-steward_auth` | nobody but the host, over https | yes |
+| https, with a path | `__Secure-steward_auth` | a sibling subdomain over https (not a network attacker over http) | no: a fresh cookie per start, so two sign-ins in one browser still break each other |
+| http, loopback only | `steward_auth` | any server on this machine's loopback, at any port (another local user, a container's published port, a local web app) | yes: a single-user development setup accepts that; on a shared machine, serve https at the root of a host |
+
+Another app on the issuer's own host is the same origin and outside any
+cookie's protection. Put the issuer at the root of its own host for the
+binding to hold against everyone. (Older browsers let a nameless cookie
+whose value began `__Host-x=` pass as `__Host-x`; current ones refuse it.)
 
 **Client names.** A DCR or CIMD client chooses its own name, so the
 consent page must not let it pass for something else. The name is cleaned
@@ -465,14 +506,30 @@ sealing the tokens fails; custody failures that are Google failing are
 contents, dial errors) are not echoed; error descriptions keep to RFC
 6749's character set; the SSRF filter also refuses NAT64, 6to4, Teredo
 and other special-purpose ranges; flow cookies are `__Host-` where
-possible; client secrets are compared by digest; a static client's
-redirect URIs are validated at load and its slices copied; Google's
-endpoints must be https; the keys being unavailable is `server_error`,
-never `invalid_grant`; the consent page's text is the service's
-(`ServiceName`); and a client's name there is cleaned and kept apart from
-its client ID and redirect host (see Client names above). Scopes are
-granted in the configuration's order, so a grant reads the same however
-the client ordered its request.
+possible and `__Secure-` on https otherwise; client secrets are compared
+by digest; a static client's redirect URIs are validated at load and its
+slices copied; Google's endpoints must be https; the keys being
+unavailable is `server_error`, never `invalid_grant`; the consent page's
+text is the service's (`ServiceName`); and a client's name there is
+cleaned and kept apart from its client ID and redirect host (see Client
+names above). Scopes are granted in the configuration's order, so a grant
+reads the same however the client ordered its request.
+
+**Ported from kode-gopher since `8b53617`.** `fb8ea5e` (kode-gopher#48):
+the browser-binding cookie is kept across sign-ins started in one browser,
+renewed on approval and no longer cleared by the callback, and a refused
+flow names its reason (Browser binding, above). steward's version keeps
+its own cookie names (kode-gopher sets every cookie on `/` and prefixes
+`__Host-` on any https issuer; steward scopes cookies to the issuer's
+path, which `__Host-` forbids for an issuer with a path), adds
+`__Secure-` for that case and keeps no existing cookie there (a sibling
+subdomain can plant one; kode-gopher has no such case), logs through the
+server's logger, and answers the keys being unavailable with a 503
+instead of a damaged-link page. kode-gopher's known limitation holds here
+too: the vault's consent leg parks the flow in one `steward_consent`
+cookie, so two sign-ins that both reach the vault's own consent screen
+still collide (the later one replaces the earlier one's); finish one
+first.
 
 ### Both paths on one resource (`httpauth`, `mcpauth`)
 

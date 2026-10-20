@@ -228,7 +228,7 @@ func TestCookieNames(t *testing.T) {
 	t.Parallel()
 	for issuer, want := range map[string]string{
 		"https://svc.example.com":       "__Host-steward_auth",
-		"https://svc.example.com/oauth": "steward_auth",
+		"https://svc.example.com/oauth": "__Secure-steward_auth",
 		"http://127.0.0.1:8080":         "steward_auth",
 	} {
 		c := goodConfig(t)
