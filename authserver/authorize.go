@@ -20,6 +20,7 @@ import (
 	"crypto/subtle"
 	"encoding/base64"
 	"errors"
+	"fmt"
 	"html/template"
 	"net/http"
 	"net/url"
@@ -113,7 +114,7 @@ func (s *Server) handleAuthorize(w http.ResponseWriter, r *http.Request) {
 		s.redirectError(w, r, redirectURI, q.Get("state"), aerr)
 		return
 	}
-	browser := s.bindBrowser(w)
+	browser := s.bindBrowser(w, r)
 	if c.static != nil {
 		s.toGoogle(w, r, req, browser)
 		return
@@ -184,14 +185,18 @@ func (s *Server) grantScopes(requested, allowed []string) (string, bool) {
 func (s *Server) handleApprove(w http.ResponseWriter, r *http.Request) {
 	r.Body = http.MaxBytesReader(w, r.Body, 64<<10)
 	var b browserBound
-	if s.open(r.Context(), purposeConsent, r.PostFormValue("request"), &b) != nil || s.now().Unix() > b.Exp || !s.sameBrowser(r, b.Browser) {
-		s.authPage(w, http.StatusBadRequest, "Sign-in expired", "This sign-in page has expired or was opened in another browser. Start again from your client.")
+	ck, ok := s.openBound(w, r, stepConsentPage, purposeConsent, r.PostFormValue("request"), &b)
+	if !ok {
 		return
 	}
 	if r.PostFormValue("action") != "approve" {
 		s.redirectError(w, r, b.Req.RedirectURI, b.Req.State, &authError{"access_denied", "the user declined"})
 		return
 	}
+	// Renew the binding cookie: Google sign-in gets a fresh AuthRequestTTL
+	// in its state, and the cookie must last as long. openBound has checked
+	// that this is the cookie the flow is bound to.
+	s.setCookie(w, cookieBrowser, ck)
 	s.toGoogle(w, r, &b.Req, b.Browser)
 }
 
@@ -214,11 +219,11 @@ func (s *Server) toGoogle(w http.ResponseWriter, r *http.Request, req *authReque
 func (s *Server) handleCallback(w http.ResponseWriter, r *http.Request) {
 	q := r.URL.Query()
 	var b browserBound
-	if s.open(r.Context(), purposeState, q.Get("state"), &b) != nil || s.now().Unix() > b.Exp || !s.sameBrowser(r, b.Browser) {
-		s.authPage(w, http.StatusBadRequest, "Sign-in expired", "This sign-in has expired or was started in another browser. Start again from your client.")
+	if _, ok := s.openBound(w, r, stepCallback, purposeState, q.Get("state"), &b); !ok {
 		return
 	}
-	s.clearCookie(w, cookieBrowser)
+	// The binding cookie stays: another sign-in started in this browser may
+	// still need it. It expires AuthRequestTTL after the last start.
 	req := &b.Req
 	fail := func(code, desc string) {
 		s.redirectError(w, r, req.RedirectURI, req.State, &authError{code, desc})
@@ -294,10 +299,13 @@ func (s *Server) toConsent(w http.ResponseWriter, r *http.Request, req *authRequ
 
 // handleConsentContinue is where the vault's consent leg returns.
 func (s *Server) handleConsentContinue(w http.ResponseWriter, r *http.Request) {
-	ck, err := r.Cookie(s.cookieName(cookieConsent))
 	var p pendingConsent
-	if err != nil || s.open(r.Context(), purposePending, ck.Value, &p) != nil || s.now().Unix() > p.Exp {
-		s.authPage(w, http.StatusBadRequest, "Sign-in expired", "This consent has expired or was started in another browser. Start again from your client.")
+	stop := stopNoCookie
+	if ck, err := r.Cookie(s.cookieName(cookieConsent)); err == nil {
+		stop = s.openStop(r, purposePending, ck.Value, &p, &p.Exp)
+	}
+	if stop != nil {
+		s.signInStopped(w, r, stepVaultConsent, stop)
 		return
 	}
 	s.clearCookie(w, cookieConsent)
@@ -337,20 +345,105 @@ func clientLabel(req *authRequest) string {
 	return req.ClientID
 }
 
-// bindBrowser sets a fresh random cookie and returns its hash, which the
-// sealed flow state carries.
-func (s *Server) bindBrowser(w http.ResponseWriter) string {
+// bindBrowser returns the hash of the browser's binding cookie, which the
+// sealed flow state carries, and renews the cookie's lifetime. Where
+// keepsBinding allows, it keeps a well-formed cookie the browser already
+// has, so a second sign-in started in the same browser (a retry, a copied
+// link next to the client's tab, a prefetch) doesn't break the first.
+func (s *Server) bindBrowser(w http.ResponseWriter, r *http.Request) string {
 	v := rand.Text()
+	if ck, err := r.Cookie(s.cookieName(cookieBrowser)); err == nil && s.keepsBinding() && browserCookieRE.MatchString(ck.Value) {
+		v = ck.Value
+	}
 	s.setCookie(w, cookieBrowser, v)
 	return hashCookie(v)
 }
 
-func (s *Server) sameBrowser(r *http.Request, want string) bool {
-	ck, err := r.Cookie(s.cookieName(cookieBrowser))
-	if err != nil {
-		return false
+// keepsBinding reports whether bindBrowser may keep an existing binding
+// cookie: only where nobody else can plant one. A planter whose value
+// bindBrowser kept would know the binding of the victim's own later flows,
+// so a stolen Google state (it travels through Google and the URL bar)
+// would let them finish the victim's flow as themselves and hand the
+// victim's client a code for their account. That rules out an https issuer
+// with a path, whose __Secure- cookie a sibling subdomain can plant; such
+// an issuer starts every sign-in with a fresh cookie, as before, and two
+// sign-ins in one browser still break each other there. At the root of an
+// https issuer the cookie is __Host-; on a loopback http issuer, only
+// software on the same machine can plant one (docs/DESIGN.md).
+func (s *Server) keepsBinding() bool {
+	return s.issuer.Scheme != "https" || s.issuer.Path == ""
+}
+
+// browserCookieRE matches what rand.Text makes, the only binding cookie
+// bindBrowser keeps. The length is rand.Text's, which may grow.
+var browserCookieRE = regexp.MustCompile(fmt.Sprintf(`^[A-Z2-7]{%d}$`, len(rand.Text())))
+
+// Where a sign-in can stop, for the log: fixed names, not the request's
+// path.
+const (
+	stepConsentPage  = "consent page"
+	stepCallback     = "Google callback"
+	stepVaultConsent = "vault consent"
+)
+
+// signInStop is why a sign-in can't continue in this browser: a short
+// reason for the log and a sentence for the page.
+type signInStop struct {
+	reason, page string
+}
+
+var (
+	stopUnreadable = &signInStop{"unreadable", "This sign-in link is damaged, or another server issued it."}
+	stopExpired    = &signInStop{"expired", fmt.Sprintf("This sign-in took more than %d minutes and has expired.", int(AuthRequestTTL.Minutes()))}
+	stopNoCookie   = &signInStop{"no cookie", "This browser has no record of starting this sign-in. It was probably started in another browser or browser profile (signing in to a different Google account can move you to another Chrome profile), or this browser blocks cookies for this site."}
+	stopOtherFlow  = &signInStop{"another sign-in's cookie", "This browser started a different sign-in. This one was started in another browser or browser profile, or after this browser's record of it expired."}
+	// stopKeys is the sealing keys being unavailable. The link may be
+	// fine, so it is a 503 and the user may retry it.
+	stopKeys = &signInStop{"keys unavailable", "Sign-in isn't available right now. Try again in a moment."}
+)
+
+// openStop opens a sealed flow envelope into v, whose expiry lands in
+// *exp, and returns why the flow can't continue, or nil.
+func (s *Server) openStop(r *http.Request, purpose, sealed string, v any, exp *int64) *signInStop {
+	switch err := s.open(r.Context(), purpose, sealed, v); {
+	case errors.Is(err, errKeys):
+		return stopKeys
+	case err != nil:
+		return stopUnreadable
+	case s.now().Unix() > *exp:
+		return stopExpired
 	}
-	return subtle.ConstantTimeCompare([]byte(hashCookie(ck.Value)), []byte(want)) == 1
+	return nil
+}
+
+// openBound opens a browser-bound envelope and checks that it belongs to
+// this browser, returning the binding cookie's value. If it doesn't, it
+// shows and logs why and returns false.
+func (s *Server) openBound(w http.ResponseWriter, r *http.Request, step, purpose, sealed string, b *browserBound) (string, bool) {
+	stop := s.openStop(r, purpose, sealed, b, &b.Exp)
+	ck, err := r.Cookie(s.cookieName(cookieBrowser))
+	switch {
+	case stop != nil:
+	case err != nil:
+		stop = stopNoCookie
+	case subtle.ConstantTimeCompare([]byte(hashCookie(ck.Value)), []byte(b.Browser)) != 1:
+		stop = stopOtherFlow
+	default:
+		return ck.Value, true
+	}
+	s.signInStopped(w, r, step, stop)
+	return "", false
+}
+
+// signInStopped logs why a sign-in stopped at step and shows it.
+func (s *Server) signInStopped(w http.ResponseWriter, r *http.Request, step string, stop *signInStop) {
+	if stop == stopKeys {
+		// open has logged the keyring's error.
+		s.authPage(w, http.StatusServiceUnavailable, "Try again", stop.page)
+		return
+	}
+	s.log.InfoContext(r.Context(), "authserver: sign-in stopped", "step", step, "reason", stop.reason)
+	s.authPage(w, http.StatusBadRequest, "Sign-in can't continue", stop.page+" Start again from your client.")
 }
 
 func hashCookie(v string) string {
@@ -365,13 +458,24 @@ func (s *Server) cookiePath() string {
 	return s.issuer.Path + "/"
 }
 
-// cookieName prefixes a flow cookie with __Host- where the browser allows
-// it (https, Path=/), so a sibling subdomain cannot set or shadow it.
+// cookieName prefixes a flow cookie so that browsers refuse a planted one,
+// as far as the issuer allows. At the root of an https issuer it is
+// __Host-: only this host, over https, can set it, so neither a network
+// attacker (over http) nor a sibling subdomain can. __Host- requires
+// Path=/, so an https issuer with a path gets __Secure-: only an https
+// origin can set it, which stops a network attacker but not a sibling
+// subdomain. A loopback http issuer gets no prefix: any server on the
+// loopback host, at any port, can set its cookies. Who can plant a binding
+// cookie decides whether bindBrowser keeps one (keepsBinding).
 func (s *Server) cookieName(base string) string {
-	if s.issuer.Scheme == "https" && s.issuer.Path == "" {
+	switch {
+	case s.issuer.Scheme != "https":
+		return base
+	case s.issuer.Path == "":
 		return "__Host-" + base
+	default:
+		return "__Secure-" + base
 	}
-	return base
 }
 
 // setCookie sets a flow cookie. SameSite=Lax: it must ride the top-level
