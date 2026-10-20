@@ -26,6 +26,15 @@ exported API" in [`CONTRIBUTING.md`](./CONTRIBUTING.md)).
 - **A CIMD host that redirects is an unknown client.** `authserver` gave
   it the 503 page or `server_error` ("try again"), though redirects are
   never followed and a retry cannot help.
+- **An outage is a 503, not a 401 (purser#23).** steward requires purser
+  v0.3.0, and `googletoken.ErrUnavailable` (Google not answering, 429, 5xx,
+  load shed, a failed allow-list group lookup) and
+  `authserver.ErrUnavailable` (sealing keys unavailable) now wrap
+  `purser.ErrUnavailable`. Through a `Protector`, a Google, directory or key
+  outage answers 503 with `Retry-After` and no challenge, so MCP clients
+  retry with the credential they have instead of signing in again. Bad and
+  disallowed credentials are still 401. `errors.Is` against the steward
+  sentinels is unchanged; their messages now end with purser's.
 
 ## [0.2.0] - 2026-10-17
 

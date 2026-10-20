@@ -3,7 +3,7 @@ module github.com/go-steer/steward
 go 1.26.9
 
 require (
-	github.com/go-steer/purser v0.2.0
+	github.com/go-steer/purser v0.3.0
 	github.com/modelcontextprotocol/go-sdk v1.8.0
 	golang.org/x/oauth2 v0.37.0
 )

@@ -134,13 +134,15 @@ An empty list admits no one.
   a Fallback naming the service would serve unadmitted people as the
   service, which breaks "no fallback identity". `httpauth` builds the
   middleware itself, so a consumer cannot get this wrong through steward.
-- **Under `Enforce`, an unavailable Google is a 401 too.** purser maps every
-  authentication error to 401 and logs none of them, so a Google outage
-  looks like a wave of bad tokens, and MCP clients typically answer a 401
-  by signing in again. Until purser has a 503 path for errors that do not
-  wrap `ErrUnauthenticated` (purser#23), `googletoken.Config.Logger`
-  logs every `ErrUnavailable`, without the token, so an operator can tell
-  the two apart.
+- **Under `Enforce`, an unavailable Google is a 503 with `Retry-After`.**
+  `googletoken.ErrUnavailable` and `authserver.ErrUnavailable` wrap
+  `purser.ErrUnavailable`, which purser's enforced middleware answers with
+  503 and a Warn log line since purser v0.3.0 (purser#23). A client keeps
+  its credential and retries, rather than signing in again for a token that
+  may be fine, which an MCP client does on a 401. `googletoken.Config.Logger`
+  still logs every `ErrUnavailable` without the token; with purser's own
+  Warn line it is optional, and a consumer setting both sees two lines per
+  outage.
 - An `httpauth.Protector` builds that middleware itself and wraps it
   around a second layer that attaches the verified token as an
   `oauth2.TokenSource` (`httpauth.TokenSourceFromContext`) and its

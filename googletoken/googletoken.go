@@ -93,10 +93,11 @@ const (
 var ErrInvalid = fmt.Errorf("googletoken: invalid token: %w", purser.ErrUnauthenticated)
 
 // ErrUnavailable is Google failing to answer (no response, 429, 5xx) or
-// this Verifier shedding load (MaxLookups in flight). It is never cached
-// and does not wrap purser.ErrUnauthenticated: the token may be fine, and
-// a retry may succeed.
-var ErrUnavailable = errors.New("googletoken: Google could not verify the token right now")
+// this Verifier shedding load (MaxLookups in flight). It is never cached.
+// It wraps purser.ErrUnavailable and not purser.ErrUnauthenticated: the
+// token may be fine and a retry may succeed, so purser's enforced
+// middleware answers 503 with Retry-After rather than 401.
+var ErrUnavailable = fmt.Errorf("googletoken: Google could not verify the token right now: %w", purser.ErrUnavailable)
 
 // Identity is who a verified token belongs to.
 type Identity struct {

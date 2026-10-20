@@ -250,9 +250,9 @@ func (f *failingKeys) Keyring(context.Context) (*seal.Keyring, error) {
 	return f.k, nil
 }
 
-// Keys being unavailable is a 401 from purser's middleware (every
-// authentication error is) — but if they vanish between that layer and the
-// attach layer, the attach layer answers 503, never a pass.
+// Keys being unavailable is a 503 from purser's middleware since purser
+// v0.3.0 (purser#23; TestPathBKeysDownIs503). If they vanish between that
+// layer and the attach layer, the attach layer answers 503 too, never a pass.
 func TestPathBAttachRefusesUnverified(t *testing.T) {
 	t.Parallel()
 	keys := &failingKeys{k: testKeys(t)}
