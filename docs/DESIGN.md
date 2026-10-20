@@ -491,9 +491,81 @@ until expiry, an error means not applied). A cache that cannot answer is
 `server_error`, never a pass. Giving a claim or a rotation back after a
 transient failure runs detached from the request's context, so a client
 that went away mid-refresh can retry; a `Rotate` error is followed by a
-conditional `Unrotate` in case it was applied. There is no grace period: a
-client that loses a refresh response and retries with the old token signs
-in again.
+conditional `Unrotate` in case it was applied.
+
+**Reuse grace.** MCP clients whose processes share one token store (for
+example two Claude Code processes, or one client refreshing from several
+goroutines through a token source that does not serialize them) present
+the same refresh token twice within milliseconds when they refresh at
+once. Without a grace the second presentation revokes the
+family, the first one's fresh tokens with it, and the person is signed out
+of every process. So an operator can set `Config.RefreshReuseGrace` (off
+by default; 10 s is a reasonable value): for that long after a rotation,
+presenting exactly the generation the family has just
+moved away from is refused with `invalid_grant` but does not revoke the
+family: the winner's tokens stay valid, and a client with a shared store
+re-reads them. An older generation, the same one after the window, or any
+token of a revoked family still revokes. Nothing is ever issued for a
+rotated token, so the grace never adds a live token (unlike the reuse
+intervals of some providers, which hand out a second set), and both
+refusals read the same to the client, so a thief cannot tell whether the
+family survived. The log tells them apart.
+
+- *Concurrency.* The rotation is the cache's atomic step at the start of
+  the refresh, so the first request to reach it wins; the second, still in
+  flight or not, is refused at the same step. If the winner then fails for
+  a transient reason, its `Unrotate` moves the family back and forgets the
+  grace, so the shared token works again for both, and the generation
+  before it is a replay again. (`Unrotate` is conditional on the
+  generation, not on which request rotated: with a shared cache, a
+  `Rotate` that failed without applying can undo a concurrent winner's
+  rotation, so a retry mints a second branch. That predates the grace;
+  what changes is that the dead branch's token, presented inside the
+  window, is refused without revoking.)
+- *State.* One more time per family, the grace deadline of its last
+  rotation, kept and checked with the generation. A cache supplies it by
+  implementing `GraceReplayCache` (`RotateGrace`, additive beside
+  `ReplayCache`, so existing shared caches still compile); one that does
+  not gets no grace and revokes on every reuse, as before. Replicas sharing
+  a cache share the grace. With a per-replica `MemoryReplayCache`, the
+  second presentation on another replica is the per-replica weakness above
+  (a fresh rotation there), with or without a grace. The deadline is an
+  absolute time from the server's clock, like the family's expiry, so
+  clock skew between replicas stretches or shrinks the window by the skew.
+- *What it costs.* Reuse detection (RFC 9700 §4.14.2) works by one of two
+  holders of a token presenting it after the other has rotated it. Within
+  the window that presentation is refused but not reported by revocation.
+  If the victim refreshes first, the thief's token is dead anyway; the
+  window only spares the victim the sign-out, and a thief retrying after
+  the window revokes as before. The loss is the other order: a thief who
+  refreshes less than the window before the victim's next refresh keeps
+  the family, if the victim's client then signs in afresh rather than
+  presenting the stale token again (which, after the window, revokes). A
+  thief who cannot see the victim's schedule lands there with probability
+  about window ÷ refresh interval: with a 10 s grace and 15-minute
+  access tokens, about 1 %. One who knows the victim's token expiry (it
+  sits in the same store) can aim for it; the window bounds how precisely
+  they must aim, and no window short of zero removes it. That loss, and
+  the go-sdk client's limited benefit below, are why the grace is off by
+  default: an operator whose clients share a token store and see these
+  sign-outs turns it on. 10 s covers a winner's round trip from rotation
+  to writing its store (admission, one or two Google or vault calls, the
+  response); the limit is a minute, and a negative value is refused.
+- *Clients.* The grace helps a client that, refused, re-reads its store
+  before trying again; it is for such clients that it exists. The go-sdk
+  MCP client (v1.8.0) does not: its token source
+  (`oauth2.Config.TokenSource`) serializes refreshes per handler, so it
+  collides only across handlers or processes that share tokens (through
+  `NewTokenSource` or `InitialTokenSource`). On `invalid_grant` it sends
+  the request without a token and runs `Authorize` on the 401, keeping the
+  stale token source until a new sign-in completes. Any request it sends
+  meanwhile, after the window, presents the stale token again and revokes
+  the family, so for it the grace often only delays the sign-out; a
+  `NewTokenSource` that re-reads the shared store on `invalid_grant`
+  avoids that. (In the theft case, that later presentation is what
+  restores detection.) A client that loses a refresh response and retries
+  with the old token within the window gets `invalid_grant` (it lost the
+  new token) and signs in again; the family it leaves behind expires.
 
 **Client credentials.** A pre-registered confidential client with
 `ClientCredentials` (or a `ServiceAccount`, which implies it) gets an
@@ -524,7 +596,8 @@ dedicated source would be a purser addition.
 resource, Google scopes, optional workload service account, `Admitter`,
 pluggable replay cache and keys, slog), most from this port's adversarial
 review and worth porting back: refresh-token families with reuse
-detection instead of one replay entry per refresh; refresh re-checks the
+detection instead of one replay entry per refresh, and the reuse grace
+that spares a concurrent refresh's family; refresh re-checks the
 grant's scopes against the configuration; a narrowing refresh does not
 narrow the grant; rotating a workload's secret revokes its tokens; an
 email change since sign-in forces a new sign-in; the refresh token's

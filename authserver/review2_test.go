@@ -61,14 +61,21 @@ func (c *ctxReplay) Release(ctx context.Context, id string) error {
 }
 
 func (c *ctxReplay) Rotate(ctx context.Context, fam string, gen uint64, exp time.Time) (bool, error) {
-	ok, err := c.MemoryReplayCache.Rotate(ctx, fam, gen, exp)
+	r, err := c.RotateGrace(ctx, fam, gen, exp, time.Time{})
+	return r == RotateApplied, err
+}
+
+// RotateGrace overrides the embedded cache's too, as GraceReplayCache
+// tells a wrapper to, or the server would skip the override.
+func (c *ctxReplay) RotateGrace(ctx context.Context, fam string, gen uint64, exp, graceUntil time.Time) (RotateResult, error) {
+	r, err := c.MemoryReplayCache.RotateGrace(ctx, fam, gen, exp, graceUntil)
 	c.mu.Lock()
 	defer c.mu.Unlock()
 	if c.failAfterApply {
 		c.failAfterApply = false
-		return false, errors.New("timeout after write")
+		return RotateRevoked, errors.New("timeout after write")
 	}
-	return ok, err
+	return r, err
 }
 
 // cancellingAdmitter cancels the request mid-refresh and fails, like a
