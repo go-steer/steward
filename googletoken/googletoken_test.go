@@ -41,7 +41,8 @@ const (
 var now = time.Date(2026, 10, 9, 12, 0, 0, 0, time.UTC)
 
 // fakeGoogle answers tokeninfo (POST /tokeninfo) and userinfo (GET
-// /userinfo) for the tokens it knows, as Google's endpoints do. A token's
+// /userinfo) for the tokens it knows, as Google's endpoints do (an unknown
+// token: tokeninfo 400 invalid_token, userinfo 401). A token's
 // "hd" and "user_email" go in userinfo's answer, the rest in tokeninfo's;
 // "status" makes both fail with that HTTP status.
 func fakeGoogle(t *testing.T, tokens map[string]map[string]string) (string, *atomic.Int32) {
@@ -60,8 +61,12 @@ func fakeGoogle(t *testing.T, tokens map[string]map[string]string) (string, *ato
 			tok = strings.TrimPrefix(r.Header.Get("Authorization"), "Bearer ")
 		}
 		info, ok := tokens[tok]
-		if !ok {
-			http.Error(w, `{"error":"invalid_token"}`, http.StatusBadRequest)
+		switch {
+		case !ok && r.URL.Path == "/userinfo":
+			http.Error(w, `{"error":"invalid_request","error_description":"Invalid Credentials"}`, http.StatusUnauthorized)
+			return
+		case !ok:
+			http.Error(w, `{"error":"invalid_token","error_description":"Invalid Value"}`, http.StatusBadRequest)
 			return
 		}
 		if s := info["status"]; s != "" {

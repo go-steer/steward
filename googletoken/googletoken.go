@@ -86,14 +86,25 @@ const (
 	maxBody = 64 << 10
 )
 
+// The statuses Google's endpoints answer a token they reject with: the
+// only non-200 answers that are verdicts on the token. tokeninfo answers
+// 400 {"error":"invalid_token"}, userinfo 401 (both checked against Google
+// with a bogus token, 2026-10-20).
+const (
+	tokenInfoRefused = http.StatusBadRequest
+	userInfoRefused  = http.StatusUnauthorized
+)
+
 // ErrInvalid is a token Google refused, or one that fails a check: not
 // issued to this service, missing a scope, expired, unverified. It wraps
 // purser.ErrUnauthenticated, so purser's middleware treats it as any
 // other bad credential.
 var ErrInvalid = fmt.Errorf("googletoken: invalid token: %w", purser.ErrUnauthenticated)
 
-// ErrUnavailable is Google failing to answer (no response, 429, 5xx) or
-// this Verifier shedding load (MaxLookups in flight). It is never cached.
+// ErrUnavailable is Google failing to answer (no response, 429, 5xx, or
+// any other answer that is not Google's verdict on the token, such as an
+// egress proxy's 403 or 407, or a 404 from a moved endpoint) or this
+// Verifier shedding load (MaxLookups in flight). It is never cached.
 // It wraps purser.ErrUnavailable and not purser.ErrUnauthenticated: the
 // token may be fine and a retry may succeed, so purser's enforced
 // middleware answers 503 with Retry-After rather than 401.
@@ -133,7 +144,9 @@ type Config struct {
 	// carry the token) into its error text; net/http's own never does.
 	HTTPClient *http.Client
 
-	// Logger receives one warning per ErrUnavailable, without the token.
+	// Logger receives one warning per ErrUnavailable, without the token;
+	// a Debug line instead when the caller's context was cancelled (the
+	// client went away), which is no outage.
 	// It is optional behind purser's middleware, which answers an
 	// ErrUnavailable with 503 and logs it at Warn itself, through
 	// CallerOptions.Logger or else slog.Default(): setting this as well
@@ -223,9 +236,23 @@ func New(cfg Config) (*Verifier, error) {
 func (v *Verifier) Verify(ctx context.Context, token string) (Identity, error) {
 	id, err := v.verify(ctx, token)
 	if err != nil && v.log != nil && errors.Is(err, ErrUnavailable) {
-		v.log.WarnContext(ctx, "googletoken: could not verify a token", "err", err)
+		logUnavailable(ctx, v.log, "googletoken: could not verify a token", err)
 	}
 	return id, err
+}
+
+// logUnavailable reports an ErrUnavailable at Warn, or at Debug when the
+// caller's context was cancelled: the client went away mid-request, the
+// lookup failed with it, and that is no outage. Canceled only: a deadline
+// that ran out (DeadlineExceeded) is a dependency too slow to answer,
+// which is the outage this line reports. purser's httpmw.CallerMiddleware
+// draws the same line.
+func logUnavailable(ctx context.Context, log *slog.Logger, msg string, err error) {
+	if errors.Is(ctx.Err(), context.Canceled) {
+		log.DebugContext(ctx, msg+"; the client had already gone", "err", err)
+		return
+	}
+	log.WarnContext(ctx, msg, "err", err)
 }
 
 func (v *Verifier) verify(ctx context.Context, token string) (Identity, error) {
@@ -321,7 +348,7 @@ func (v *Verifier) lookup(ctx context.Context, token string, now time.Time) (Ide
 		EmailVerified lenient `json:"email_verified"`
 		Exp           lenient `json:"exp"`
 	}
-	if err := v.fetch(req, "tokeninfo", &info); err != nil {
+	if err := v.fetch(req, "tokeninfo", tokenInfoRefused, &info); err != nil {
 		return Identity{}, time.Time{}, err
 	}
 	exp, err := strconv.ParseInt(string(info.Exp), 10, 64)
@@ -349,7 +376,7 @@ func (v *Verifier) lookup(ctx context.Context, token string, now time.Time) (Ide
 		Email string `json:"email"`
 		HD    string `json:"hd"`
 	}
-	if err := v.fetch(req, "userinfo", &user); err != nil {
+	if err := v.fetch(req, "userinfo", userInfoRefused, &user); err != nil {
 		return Identity{}, time.Time{}, err
 	}
 	if !strings.EqualFold(user.Email, info.Email) {
@@ -371,13 +398,15 @@ func (v *Verifier) lookup(ctx context.Context, token string, now time.Time) (Ide
 
 // fetch sends req and decodes its JSON answer into out.
 //
-// Only a complete non-2xx answer other than 429 is Google refusing
-// (ErrInvalid, which Verify caches). Everything else is ErrUnavailable,
-// never cached: no answer, 429, 5xx, a body cut short (the client went
-// away, the timeout fired, the connection dropped) and a 200 whose body
-// does not parse. Treating a half-read body as a refusal would let one
-// disconnecting client lock a person's valid token out for RefusedTTL.
-func (v *Verifier) fetch(req *http.Request, what string, out any) error {
+// Only refused, the status the endpoint answers a token it rejects with,
+// is Google refusing (ErrInvalid, which Verify caches). Everything else
+// is ErrUnavailable, never cached: no answer, 429, 5xx, any other status
+// (an egress proxy's 403 or 407, a 404 from a moved endpoint: nothing
+// Google said about the token), a body cut short (the client went away,
+// the timeout fired, the connection dropped) and a 200 whose body does
+// not parse. Treating any of those as a refusal would lock a person's
+// valid token out for RefusedTTL and send their client to sign in again.
+func (v *Verifier) fetch(req *http.Request, what string, refused int, out any) error {
 	resp, err := v.hc.Do(req)
 	if err != nil {
 		// A *url.Error names the URL, never the body or headers, so the
@@ -385,11 +414,12 @@ func (v *Verifier) fetch(req *http.Request, what string, out any) error {
 		return fmt.Errorf("%w: %s: %w", ErrUnavailable, what, err)
 	}
 	defer func() { _ = resp.Body.Close() }()
-	switch {
-	case resp.StatusCode == http.StatusTooManyRequests || resp.StatusCode >= 500:
+	switch resp.StatusCode {
+	case http.StatusOK:
+	case refused:
+		return ErrInvalid // an expired, revoked or malformed token
+	default:
 		return fmt.Errorf("%w: %s: HTTP %d", ErrUnavailable, what, resp.StatusCode)
-	case resp.StatusCode != http.StatusOK:
-		return ErrInvalid // an expired, revoked or foreign token
 	}
 	body, err := io.ReadAll(io.LimitReader(resp.Body, maxBody))
 	if err == nil {

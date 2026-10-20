@@ -64,6 +64,38 @@ exported API" in [`CONTRIBUTING.md`](./CONTRIBUTING.md)).
   10 minutes old, this browser didn't start it, or this browser started a
   different one. The sealing keys being unavailable is now a 503 page to
   retry rather than "Sign-in expired". Ported from kode-gopher `fb8ea5e`.
+- **`googletoken`: only Google's verdict on a token is a refusal**
+  (#14). A non-200 tokeninfo or userinfo answer other than 429 or 5xx was
+  `ErrInvalid`: cached for 30 s and a 401, so an egress proxy's 403 or
+  407, or a 404 from a moved endpoint, sent clients to sign in again. Only
+  tokeninfo's 400 `invalid_token` and userinfo's 401 are `ErrInvalid` now;
+  every other status is `ErrUnavailable` (never cached, a 503 with
+  `Retry-After` behind purser).
+- **`googletoken`: a client that went away is not an outage.** The
+  Verifier's `Config.Logger` line and the Authenticator's group-check line
+  are Debug, not Warn, when the request's context was cancelled, as
+  purser's middleware does. A deadline that ran out is still a Warn.
+- **`authserver`: a busy vault no longer signs people out.** Under
+  `VaultCustody`, a `pending` or empty answer from the credential vault was
+  treated as a grant only the user could repair: `invalid_grant` at
+  refresh. It is `server_error` now (the refresh token is given back for
+  the retry), and `server_error`, not `access_denied`, at sign-in: the
+  vault's API reference says to retry a `pending` answer.
+- **`authserver`: a nearly spent vault token no longer signs people out.**
+  A vault token with under 5 minutes left is force-refreshed, and the vault
+  answers a forced refresh of a token that is still valid by asking for
+  consent; that was `invalid_grant`. When forcing a valid token brings no
+  better one, short of a refusal, the valid token is now used if it has 3
+  minutes left, and the answer is otherwise `server_error`.
+- **`authserver`: a vault token Google's tokeninfo refuses is a refusal.**
+  A 400 `invalid_token` from tokeninfo was `server_error`. The token is now
+  force-refreshed once (it may have expired before the vault's
+  `expireTime`). If the vault then asks for consent, sign-in detours
+  through it and refresh answers `invalid_grant`; if Google refuses the new
+  token too, sign-in answers `access_denied` and refresh `invalid_grant`.
+  Other tokeninfo failures stay `server_error`.
+- **`authserver`: a vault error that quotes a forced token back** has the
+  token replaced before the error is logged.
 
 ### Security
 

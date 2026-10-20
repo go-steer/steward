@@ -140,7 +140,7 @@ func (a *Authenticator) Verify(r *http.Request) (Identity, error) {
 		// The directory failing is not the directory refusing.
 		err = fmt.Errorf("%w: allow-list group check: %v", ErrUnavailable, err)
 		if a.v.log != nil {
-			a.v.log.WarnContext(r.Context(), "googletoken: could not admit a verified account", "err", err)
+			logUnavailable(r.Context(), a.v.log, "googletoken: could not admit a verified account", err)
 		}
 		return Identity{}, err
 	}
