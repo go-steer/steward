@@ -30,6 +30,8 @@ import (
 	"strings"
 	"testing"
 	"time"
+
+	"github.com/go-steer/purser"
 )
 
 // cached reports whether Verify left any verdict for token in the cache.
@@ -216,5 +218,124 @@ func TestLoggerReportsUnavailable(t *testing.T) {
 	}
 	if strings.Contains(out, "planted-secret") {
 		t.Errorf("the log line carries the token: %q", out)
+	}
+}
+
+// TestOnlyGoogleVerdictsAreRefusals (steward#14): a non-200 answer is a
+// refusal only when it is the endpoint's own verdict on the token,
+// tokeninfo's 400 invalid_token or userinfo's 401. Any other status (an
+// egress proxy's 403 or 407, a 404 from a moved endpoint) says nothing
+// about the token: ErrUnavailable (a 503 behind purser), never cached.
+func TestOnlyGoogleVerdictsAreRefusals(t *testing.T) {
+	t.Parallel()
+	good := info(clientID, "dana@cymbal.example", "true", now.Add(time.Hour))
+	for _, c := range []struct {
+		endpoint string
+		status   int
+		refusal  bool
+	}{
+		{"tokeninfo", http.StatusBadRequest, true},
+		{"tokeninfo", http.StatusUnauthorized, false},
+		{"tokeninfo", http.StatusForbidden, false},
+		{"tokeninfo", http.StatusNotFound, false},
+		{"tokeninfo", http.StatusProxyAuthRequired, false},
+		{"tokeninfo", http.StatusTeapot, false},
+		{"userinfo", http.StatusUnauthorized, true},
+		{"userinfo", http.StatusBadRequest, false},
+		{"userinfo", http.StatusForbidden, false},
+		{"userinfo", http.StatusNotFound, false},
+		{"userinfo", http.StatusProxyAuthRequired, false},
+	} {
+		name := c.endpoint + " " + strconv.Itoa(c.status)
+		srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			if strings.TrimPrefix(r.URL.Path, "/") == c.endpoint {
+				http.Error(w, `<html>not Google</html>`, c.status)
+				return
+			}
+			out := map[string]string{"email": good["email"], "hd": good["hd"]}
+			if r.URL.Path == "/tokeninfo" {
+				out = good
+			}
+			_ = json.NewEncoder(w).Encode(out)
+		}))
+		v, err := New(Config{ClientIDs: []string{clientID}, TokenInfoURL: srv.URL + "/tokeninfo", UserInfoURL: srv.URL + "/userinfo",
+			Now: func() time.Time { return now }})
+		if err != nil {
+			t.Fatal(err)
+		}
+		const tok = "ya29.valid-token"
+		_, err = v.Verify(context.Background(), tok)
+		srv.Close()
+		if c.refusal {
+			if !errors.Is(err, ErrInvalid) || errors.Is(err, ErrUnavailable) || !cached(v, tok) {
+				t.Errorf("%s: %v (cached %v), want ErrInvalid, cached", name, err, cached(v, tok))
+			}
+			continue
+		}
+		if !errors.Is(err, ErrUnavailable) || !errors.Is(err, purser.ErrUnavailable) || errors.Is(err, ErrInvalid) || errors.Is(err, purser.ErrUnauthenticated) {
+			t.Errorf("%s: %v, want ErrUnavailable and not a credential error", name, err)
+		}
+		if cached(v, tok) {
+			t.Errorf("%s: cached as a verdict", name)
+		}
+		if err != nil && (strings.Contains(err.Error(), tok) || !strings.Contains(err.Error(), "HTTP "+strconv.Itoa(c.status))) {
+			t.Errorf("%s: error %q should name the status and not the token", name, err)
+		}
+	}
+}
+
+// TestCancelledClientIsNotAnOutage (steward#14): a lookup that failed
+// because the client went away (its context cancelled) is logged at
+// Debug, not Warn, as purser does; a deadline that ran out is still an
+// outage at Warn.
+func TestCancelledClientIsNotAnOutage(t *testing.T) {
+	t.Parallel()
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		http.Error(w, "{}", http.StatusServiceUnavailable)
+	}))
+	defer srv.Close()
+	var buf bytes.Buffer
+	v, err := New(Config{ClientIDs: []string{clientID}, TokenInfoURL: srv.URL, UserInfoURL: srv.URL,
+		Logger: slog.New(slog.NewTextHandler(&buf, &slog.HandlerOptions{Level: slog.LevelDebug}))})
+	if err != nil {
+		t.Fatal(err)
+	}
+	gone, cancel := context.WithCancel(context.Background())
+	cancel()
+	if _, err := v.Verify(gone, "ya29.planted-secret-token"); !errors.Is(err, ErrUnavailable) {
+		t.Fatalf("cancelled: %v, want ErrUnavailable", err)
+	}
+	if out := buf.String(); strings.Contains(out, "level=WARN") || !strings.Contains(out, "level=DEBUG") || strings.Contains(out, "planted-secret") {
+		t.Errorf("a client that went away was logged as an outage, or not at Debug: %q", out)
+	}
+	buf.Reset()
+	late, stop := context.WithDeadline(context.Background(), time.Unix(1, 0))
+	defer stop()
+	_, _ = v.Verify(late, "another-token")
+	if out := buf.String(); !strings.Contains(out, "level=WARN") {
+		t.Errorf("a deadline that ran out was not logged as an outage: %q", out)
+	}
+}
+
+// TestCancelledClientGroupCheckIsNotAnOutage: the Authenticator's own
+// Warn for a failed group check drops to Debug when the client went away.
+func TestCancelledClientGroupCheckIsNotAnOutage(t *testing.T) {
+	t.Parallel()
+	var buf bytes.Buffer
+	a := newGroupAuthenticator(t, groupChecker{fail: true}, nil)
+	a.v.log = slog.New(slog.NewTextHandler(&buf, &slog.HandlerOptions{Level: slog.LevelDebug}))
+	// Verified (and cached) while the client is there; the group check
+	// fails either way.
+	if _, err := a.Verify(request("Bearer good")); !errors.Is(err, ErrUnavailable) || !strings.Contains(buf.String(), "level=WARN") {
+		t.Fatalf("group check failure: %v, log %q, want ErrUnavailable at Warn", err, buf.String())
+	}
+	buf.Reset()
+	gone, cancel := context.WithCancel(context.Background())
+	cancel()
+	if _, err := a.Verify(request("Bearer good").WithContext(gone)); !errors.Is(err, ErrUnavailable) {
+		t.Fatalf("cancelled: %v, want ErrUnavailable", err)
+	}
+	if out := buf.String(); strings.Contains(out, "level=WARN") || !strings.Contains(out, "level=DEBUG") {
+		t.Errorf("a client that went away was logged as an outage: %q", out)
 	}
 }

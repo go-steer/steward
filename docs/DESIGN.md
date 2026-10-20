@@ -67,12 +67,20 @@ Bounds, so that garbage tokens cannot turn into a flood of calls to Google:
 - At most 8 lookups run at once; past that a token not in the cache is
   turned away as unavailable (load-shedding, not a verdict).
 - At most 1024 cache entries.
-- Only a complete non-2xx answer other than 429 is Google refusing
-  (`ErrInvalid`, cached). Everything else is `ErrUnavailable` and
-  **never** cached: no answer, 429, 5xx, a body cut short (the client went
+- Only an endpoint's own verdict on the token is Google refusing
+  (`ErrInvalid`, cached, a 401): tokeninfo's 400 `invalid_token` and
+  userinfo's 401, the statuses each answers a bad token with (checked
+  against Google, 2026-10-20). Everything else is `ErrUnavailable` and
+  **never** cached (a 503): no answer, 429, 5xx, any other status (an
+  egress proxy's 403 or 407, a 404 from a moved endpoint, which say
+  nothing about the token; steward#14), a body cut short (the client went
   away, a timeout fired, the connection dropped), and a 200 that does not
   parse. Caching a half-read answer as a refusal would let one
   disconnecting client lock a person's valid token out for 30 s.
+- A lookup that failed because the client went away (its context
+  cancelled) is logged at Debug, not Warn, by `Config.Logger` and the
+  Authenticator alike, as purser's middleware does: it is no outage. A
+  deadline that ran out is still a Warn.
 - `exp` and `email_verified` are accepted as strings (what Google sends
   today), numbers or booleans, so a type change at Google cannot turn
   every token into a refusal.
@@ -167,7 +175,8 @@ An empty list admits no one.
   `httpauth.Options.Logger`, or `slog.Default()` when that is nil, so it is
   always on; `googletoken.Config.Logger` still logs every `ErrUnavailable`
   without the token, and is optional: setting it at all gives two lines per
-  outage request, whether or not `Options.Logger` is set.
+  outage request, whether or not `Options.Logger` is set. Both drop to
+  Debug when the client had already gone (a cancelled request context).
 - An `httpauth.Protector` builds that middleware itself and wraps it
   around a second layer that attaches the verified token as an
   `oauth2.TokenSource` (`httpauth.TokenSourceFromContext`) and its
@@ -426,15 +435,35 @@ sealed in the refresh token are stale.
   signed-in user's (the vault stores whichever account consented, under
   whatever user ID it is given, and has no delete API), it must carry
   every configured Google scope, and its expiry is tokeninfo's, never the
-  vault's `expireTime`. A token with under 5 minutes left is
-  force-refreshed once.
+  vault's `expireTime`. A token with under 5 minutes left, or one
+  tokeninfo refuses (400 `invalid_token`: expired early or revoked), is
+  force-refreshed once. The vault's API reference says a forced refresh
+  "fetches a new token or initiates a new consent flow". For a refused
+  token, a consent request is the grant gone: sign-in detours through
+  consent, refresh is `invalid_grant`. For a token Google still accepts it
+  is not: the vault declines to force-refresh a valid token by asking for
+  consent (kode-gopher's vault spike). So when forcing a valid token
+  brings no better one, short of a refusal, that token is used if it has 3
+  minutes left (enough for an access token that stops a minute before it,
+  after a code that may wait a minute), and the answer is otherwise
+  `server_error`.
 - `SealedCustody`: the Google refresh token rides inside steward's sealed
   refresh token.
 
-A grant only the user can repair (consent declined, another account's
-grant, a missing scope) is `access_denied` at sign-in and `invalid_grant`
-at refresh; Google or the vault failing is `server_error`, and a retry may
-work.
+A grant only the user can repair is `access_denied` at sign-in and
+`invalid_grant` at refresh (the client signs the person in again): consent
+declined, another account's grant, a missing scope, a changed email,
+Google's `invalid_grant` on a sealed refresh token, and a vault token
+tokeninfo refuses both before and after a forced refresh. The vault asking
+for consent is the consent detour at sign-in and `invalid_grant` at
+refresh. Google or the vault failing is `server_error`, and at refresh
+gives the refresh token back, so a retry may work: no answer, any HTTP
+error from the vault, a tokeninfo answer other than 200 or 400, the vault
+answering `pending` (its API reference: "the caller should retry ... after
+some time") or nothing usable, and a forced refresh that returns the same
+token or another nearly spent one (each unless the token it was to replace
+is still usable, above). A vault error message that quotes a forced token
+back has it replaced before it is logged.
 
 **Tokens.** All sealed, the issuer bound into every purpose:
 
@@ -502,9 +531,14 @@ email change since sign-in forces a new sign-in; the refresh token's
 audience is checked against the configured resource; more than one
 `resource` parameter is refused; an authorization code is given back if
 sealing the tokens fails; custody failures that are Google failing are
-`server_error`, not `access_denied`; client-resolution errors (CIMD
-contents, dial errors) are not echoed; error descriptions keep to RFC
-6749's character set; the SSRF filter also refuses NAT64, 6to4, Teredo
+`server_error`, not `access_denied`, including a `pending` or empty vault
+answer (a sign-out before); the vault declining to force-refresh a
+still-valid token leaves that token in use (with 3 minutes left) or is
+`server_error`, rather than signing the person out; a vault token
+tokeninfo refuses is force-refreshed once, then a consent detour at
+sign-in or a refusal, rather than `server_error`; client-resolution
+errors (CIMD contents, dial errors) are not echoed; error descriptions
+keep to RFC 6749's character set; the SSRF filter also refuses NAT64, 6to4, Teredo
 and other special-purpose ranges; flow cookies are `__Host-` where
 possible and `__Secure-` on https otherwise; client secrets are compared
 by digest; a static client's redirect URIs are validated at load and its
