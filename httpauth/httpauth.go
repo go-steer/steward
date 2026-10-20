@@ -29,8 +29,12 @@
 // seal.Prefix; a Google token never does) to one of two purser
 // httpmw.CallerMiddleware instances, each built with Enforce and no
 // Fallback around its authenticator. A request with a good token reaches
-// the handler as a purser.Caller; anything else is a 401 whose challenge
-// names this resource's RFC 9728 metadata. Behind it, a second layer
+// the handler as a purser.Caller. A missing, bad or unadmitted token is a
+// 401 whose challenge names this resource's RFC 9728 metadata. A token
+// that could not be checked (Google, the group directory or the sealing
+// keys unavailable) is a 503 with Retry-After and no challenge, so the
+// client retries with the token it has rather than signing in again.
+// Behind the purser layer, a second layer
 // attaches, for a person, the Google token as an oauth2.TokenSource
 // (TokenSourceFromContext) and their googletoken.Identity
 // (IdentityFromContext), the same on both paths, so the handler can call
@@ -111,9 +115,10 @@ type Options struct {
 	// ResourceName is a human-readable name for the metadata. Optional.
 	ResourceName string
 
-	// Logger receives purser's rejected-proxy-assertion audit line. Nil
-	// means slog.Default(). Google outages are logged by the Verifier's
-	// own Config.Logger.
+	// Logger receives purser's log lines: the rejected-proxy-assertion
+	// audit line, a Warn for every 503 (a token that could not be checked:
+	// Google, the group directory or the sealing keys unavailable) and a
+	// Debug for every 401. Nil means slog.Default().
 	Logger *slog.Logger
 }
 
@@ -387,8 +392,13 @@ func (p *Protector) attachAS(next http.Handler) http.Handler {
 	})
 }
 
+// retryAfter is the Retry-After on the attach layers' 503. It matches the
+// one purser's middleware sends, so a client sees one value whichever
+// layer found the token could not be checked.
+const retryAfter = "10"
+
 func unavailable(w http.ResponseWriter) {
-	w.Header().Set("Retry-After", "5")
+	w.Header().Set("Retry-After", retryAfter)
 	http.Error(w, "the token could not be verified right now", http.StatusServiceUnavailable)
 }
 

@@ -190,10 +190,9 @@ func TestPanicReleasesLookupSlot(t *testing.T) {
 	}
 }
 
-// TestLoggerReportsUnavailable: behind purser's enforced middleware every
-// failure is a plain 401, so the Logger line is how an operator tells a
-// Google outage from bad tokens. It must not carry the token, and a
-// refusal must not be logged as an outage.
+// TestLoggerReportsUnavailable: the optional Logger reports a Google
+// outage (purser's middleware also logs it, as a 503). It must not carry
+// the token, and a refusal must not be logged as an outage.
 func TestLoggerReportsUnavailable(t *testing.T) {
 	t.Parallel()
 	const secret = "ya29.planted-secret-token"

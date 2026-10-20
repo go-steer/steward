@@ -29,7 +29,8 @@ person's Google token, and read Google APIs as that person:
 v, err := googletoken.New(googletoken.Config{
 	ClientIDs:      []string{oauthClientID}, // the client Gemini Enterprise is configured with
 	RequiredScopes: []string{"https://www.googleapis.com/auth/cloud-platform"},
-	Logger:         slog.Default(), // so a Google outage is visible
+	// No Logger needed: an outage is a 503 that purser logs at Warn, through
+	// httpauth.Options.Logger or slog.Default(). Setting one doubles the lines.
 })
 admit, err := allow.Parse([]string{"@example.com", "contractor@gmail.com"})
 a, err := googletoken.NewAuthenticator(v, admit)

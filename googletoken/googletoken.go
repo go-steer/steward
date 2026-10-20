@@ -134,9 +134,10 @@ type Config struct {
 	HTTPClient *http.Client
 
 	// Logger receives one warning per ErrUnavailable, without the token.
-	// Behind purser's enforced middleware every failed authentication is a
-	// plain 401, so this line is how an operator tells a Google outage from
-	// a wave of bad tokens. Nil means no logging.
+	// It is optional behind purser's middleware, which answers an
+	// ErrUnavailable with 503 and logs it at Warn itself, through
+	// CallerOptions.Logger or else slog.Default(): setting this as well
+	// logs every outage twice. Nil means no logging.
 	Logger *slog.Logger
 
 	// TokenInfoURL and UserInfoURL replace Google's endpoints (tests).

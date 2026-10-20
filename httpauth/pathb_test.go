@@ -276,7 +276,7 @@ func TestPathBAttachRefusesUnverified(t *testing.T) {
 		t.Errorf("bad token behind a lenient middleware: %d, reached %v", rec.Code, reached)
 	}
 	keys.fail = true
-	if rec := call(mw.Middleware()(inner), tok); rec.Code != http.StatusServiceUnavailable || reached || rec.Header().Get("Retry-After") == "" {
+	if rec := call(mw.Middleware()(inner), tok); rec.Code != http.StatusServiceUnavailable || reached || rec.Header().Get("Retry-After") != retryAfter {
 		t.Errorf("keys gone: %d, reached %v", rec.Code, reached)
 	}
 }
