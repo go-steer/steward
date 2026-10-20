@@ -8,7 +8,27 @@ exported API" in [`CONTRIBUTING.md`](./CONTRIBUTING.md)).
 
 ## [Unreleased]
 
-*Nothing yet.*
+### Fixed
+
+- **A recreated allow-listed group no longer locks its members out for up
+  to an hour.** `CloudIdentityGroups` caches a group's resource name for
+  an hour, and a group deleted and recreated in that hour has a new one.
+  Cloud Identity can answer the old name with 403 "Permission denied ...
+  (or it may not exist)" rather than 404, and only a 404 from
+  `checkTransitiveMembership` used to trigger a fresh lookup: a 403 there
+  sent the check to the walk, whose 403 or 404 on the old name was an
+  error, as was any 403 or 404 on the walk path (editions without the
+  transitive call, and member addresses with a quote or backslash). Now a
+  403 or 404 about the group itself on a cached name, on either path,
+  looks the group up again once and retries; the edition fallback still
+  follows a 403 on a freshly looked-up name, a 5xx or 429 never counts as
+  a stale name, and a check costs at most one extra `groups:lookup`.
+  Members saw an error (a 503 on Path A, `server_error` from the
+  authorization server on Path B), never a refusal, but were kept out
+  until the cached name expired. Still not covered: a membership list
+  cached under the old name answers as the old group did for up to 5
+  minutes, and a recreated nested group is still an error until its name
+  expires.
 
 ## [0.3.0] - 2026-10-20
 
