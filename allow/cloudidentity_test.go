@@ -549,3 +549,274 @@ func TestGroupsCachesExpire(t *testing.T) {
 		t.Errorf("transitive call tried %d times an hour after its 403, want 2", n)
 	}
 }
+
+// recreatableDirectory is Cloud Identity holding one group,
+// g@d.example, whose resource name the test can change (the group deleted
+// and recreated). Calls about any other name are answered goneStatus: 403
+// "Permission denied ... (or it may not exist)" or 404, whichever the
+// test asks for. transitive says whether this edition has
+// checkTransitiveMembership (else it is 403 for every name); listStatus,
+// when set, is memberships.list's answer for the current name too (a
+// group that can't be read). The members are in@d.example and
+// o\'brien@d.example.
+type recreatableDirectory struct {
+	mu         sync.Mutex
+	current    string
+	goneStatus int
+	transitive bool
+	listStatus int
+
+	lookups, transitiveCalls, lists atomic.Int32
+}
+
+func (d *recreatableDirectory) recreate(name string) {
+	d.mu.Lock()
+	d.current = name
+	d.mu.Unlock()
+}
+
+func (d *recreatableDirectory) server(t *testing.T) *httptest.Server {
+	t.Helper()
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		d.mu.Lock()
+		cur, gone, transitive, listStatus := d.current, d.goneStatus, d.transitive, d.listStatus
+		d.mu.Unlock()
+		if r.URL.Path == "/groups:lookup" {
+			d.lookups.Add(1)
+			writeJSON(w, http.StatusOK, map[string]string{"name": cur})
+			return
+		}
+		name, call, _ := strings.Cut(strings.TrimPrefix(r.URL.Path, "/"), "/memberships")
+		isTransitive := call == ":checkTransitiveMembership"
+		if isTransitive {
+			d.transitiveCalls.Add(1)
+		} else {
+			d.lists.Add(1)
+		}
+		switch {
+		case isTransitive && !transitive:
+			http.Error(w, `{"error":{"code":403,"message":"edition"}}`, http.StatusForbidden)
+		case name != cur:
+			http.Error(w, fmt.Sprintf(`{"error":{"code":%d,"message":"Error(2028): Permission denied for resource %s (or it may not exist)."}}`, gone, name), gone)
+		case isTransitive:
+			writeJSON(w, http.StatusOK, map[string]bool{"hasMembership": strings.Contains(r.URL.Query().Get("query"), "'in@d.example'")})
+		case listStatus != 0:
+			http.Error(w, `{"error":{"code":403}}`, listStatus)
+		default:
+			writeJSON(w, http.StatusOK, map[string]any{"memberships": []any{
+				map[string]any{"preferredMemberKey": map[string]string{"id": "in@d.example"}, "type": "USER"},
+				map[string]any{"preferredMemberKey": map[string]string{"id": `o\'brien@d.example`}, "type": "USER"},
+			}})
+		}
+	}))
+	t.Cleanup(srv.Close)
+	return srv
+}
+
+// A group recreated within the hour, on an edition with the transitive
+// call, where Cloud Identity answers the old name with 403 rather than
+// 404: the walk's 403 on the old name looks the group up again, and the
+// new name keeps the transitive call.
+func TestGroupsStaleNameTransitive403(t *testing.T) {
+	t.Parallel()
+	d := &recreatableDirectory{current: "groups/old", goneStatus: http.StatusForbidden, transitive: true}
+	srv := d.server(t)
+	c := &CloudIdentityGroups{Client: srv.Client(), Endpoint: srv.URL + "/"}
+	ctx := context.Background()
+	if ok, err := c.IsMember(ctx, "g@d.example", "in@d.example"); err != nil || !ok {
+		t.Fatalf("first check = %v, %v", ok, err)
+	}
+	d.recreate("groups/new")
+	if ok, err := c.IsMember(ctx, "g@d.example", "in@d.example"); err != nil || !ok {
+		t.Errorf("member after the group was recreated = %v, %v; want true via a fresh lookup", ok, err)
+	}
+	if n := d.lookups.Load(); n != 2 {
+		t.Errorf("group looked up %d times, want 2 (one extra for the stale name)", n)
+	}
+	// The new name kept the transitive call: no walk of it.
+	lists := d.lists.Load()
+	if ok, err := c.IsMember(ctx, "g@d.example", "out@d.example"); err != nil || ok {
+		t.Errorf("non-member = %v, %v; want false", ok, err)
+	}
+	if n := d.lists.Load() - lists; n != 0 {
+		t.Errorf("new name walked (%d list calls) instead of asked transitively", n)
+	}
+	if n := d.lookups.Load(); n != 2 {
+		t.Errorf("group looked up %d times, want 2 (new name cached)", n)
+	}
+}
+
+// A group recreated within the hour on the walk path (an edition without
+// the transitive call, or a member address the walk must match), with the
+// old name answering 404 or 403: one fresh lookup, and the member is in.
+func TestGroupsStaleNameWalk(t *testing.T) {
+	t.Parallel()
+	for _, tc := range []struct {
+		name       string
+		gone       int
+		transitive bool
+		member     string
+	}{
+		{"edition 404", http.StatusNotFound, false, "in@d.example"},
+		{"edition 403", http.StatusForbidden, false, "in@d.example"},
+		{"quoted member 404", http.StatusNotFound, true, `o\'brien@d.example`},
+		{"quoted member 403", http.StatusForbidden, true, `o\'brien@d.example`},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+			d := &recreatableDirectory{current: "groups/old", goneStatus: tc.gone, transitive: tc.transitive}
+			srv := d.server(t)
+			now := time.Unix(1_800_000_000, 0)
+			c := &CloudIdentityGroups{Client: srv.Client(), Endpoint: srv.URL + "/", now: func() time.Time { return now }}
+			ctx := context.Background()
+			if ok, err := c.IsMember(ctx, "g@d.example", tc.member); err != nil || !ok {
+				t.Fatalf("first check = %v, %v", ok, err)
+			}
+			d.recreate("groups/new")
+			// Past the membership-list cache, within the name cache.
+			now = now.Add(GroupVerdictTTL + time.Second)
+			if ok, err := c.IsMember(ctx, "g@d.example", tc.member); err != nil || !ok {
+				t.Errorf("member after the group was recreated = %v, %v; want true via a fresh lookup", ok, err)
+			}
+			if n := d.lookups.Load(); n != 2 {
+				t.Errorf("group looked up %d times, want 2 (one extra for the stale name)", n)
+			}
+		})
+	}
+}
+
+// The edition fallback still works with a fresh name: the transitive
+// call's 403 is "not this edition", the group is walked, and nothing is
+// looked up again.
+func TestGroupsEditionFallbackFreshName(t *testing.T) {
+	t.Parallel()
+	d := &recreatableDirectory{current: "groups/g", goneStatus: http.StatusNotFound}
+	srv := d.server(t)
+	c := &CloudIdentityGroups{Client: srv.Client(), Endpoint: srv.URL + "/"}
+	ctx := context.Background()
+	for _, tc := range []struct {
+		member string
+		want   bool
+	}{{"in@d.example", true}, {"out@d.example", false}} {
+		if ok, err := c.IsMember(ctx, "g@d.example", tc.member); err != nil || ok != tc.want {
+			t.Errorf("IsMember(%s) = %v, %v; want %v", tc.member, ok, err, tc.want)
+		}
+	}
+	if l, tr, ls := d.lookups.Load(), d.transitiveCalls.Load(), d.lists.Load(); l != 1 || tr != 1 || ls != 1 {
+		t.Errorf("lookups %d, transitive calls %d, list calls %d; want 1, 1, 1 (fresh name: fallback, no re-lookup)", l, tr, ls)
+	}
+}
+
+// A group that can't be listed (no rights, or a recreated group not yet
+// readable) costs at most one extra lookup per check, never a loop, and
+// stays an error rather than a "no". A fresh name that can't be listed
+// costs no extra lookup at all.
+func TestGroupsStaleNameAtMostOneExtraLookup(t *testing.T) {
+	t.Parallel()
+	d := &recreatableDirectory{current: "groups/old", goneStatus: http.StatusForbidden}
+	srv := d.server(t)
+	now := time.Unix(1_800_000_000, 0)
+	c := &CloudIdentityGroups{Client: srv.Client(), Endpoint: srv.URL + "/", now: func() time.Time { return now }}
+	ctx := context.Background()
+	if ok, err := c.IsMember(ctx, "g@d.example", "in@d.example"); err != nil || !ok {
+		t.Fatalf("first check = %v, %v", ok, err)
+	}
+	d.mu.Lock()
+	d.listStatus = http.StatusForbidden
+	d.current = "groups/new"
+	d.mu.Unlock()
+	now = now.Add(GroupVerdictTTL + time.Second)
+	for i := range 3 {
+		before := d.lookups.Load()
+		if ok, err := c.IsMember(ctx, "g@d.example", "in@d.example"); ok || err == nil || !strings.Contains(err.Error(), "HTTP 403") {
+			t.Errorf("check %d on an unlistable group = %v, %v; want an HTTP 403 error", i, ok, err)
+		}
+		if n := d.lookups.Load() - before; n != 1 {
+			t.Errorf("check %d cost %d group lookups, want 1", i, n)
+		}
+	}
+	fresh := &CloudIdentityGroups{Client: srv.Client(), Endpoint: srv.URL + "/"}
+	before := d.lookups.Load()
+	if ok, err := fresh.IsMember(ctx, "g@d.example", "in@d.example"); err == nil || ok {
+		t.Errorf("fresh name on an unlistable group = %v, %v; want an error", ok, err)
+	}
+	if n := d.lookups.Load() - before; n != 1 {
+		t.Errorf("fresh name on an unlistable group cost %d lookups, want 1", n)
+	}
+}
+
+// Google failing is not a stale name: a 5xx or 429 from listing the
+// group under a cached name is an error, with no fresh lookup and the
+// name kept.
+func TestGroupsWalkOutageNotStale(t *testing.T) {
+	t.Parallel()
+	for _, status := range []int{http.StatusInternalServerError, http.StatusTooManyRequests, http.StatusServiceUnavailable} {
+		t.Run(http.StatusText(status), func(t *testing.T) {
+			t.Parallel()
+			d := &recreatableDirectory{current: "groups/g", goneStatus: http.StatusNotFound}
+			srv := d.server(t)
+			now := time.Unix(1_800_000_000, 0)
+			c := &CloudIdentityGroups{Client: srv.Client(), Endpoint: srv.URL + "/", now: func() time.Time { return now }}
+			ctx := context.Background()
+			if ok, err := c.IsMember(ctx, "g@d.example", "in@d.example"); err != nil || !ok {
+				t.Fatalf("first check = %v, %v", ok, err)
+			}
+			d.mu.Lock()
+			d.listStatus = status
+			d.mu.Unlock()
+			now = now.Add(GroupVerdictTTL + time.Second)
+			if ok, err := c.IsMember(ctx, "g@d.example", "in@d.example"); err == nil || ok {
+				t.Errorf("check during an outage = %v, %v; want an error", ok, err)
+			}
+			if n := d.lookups.Load(); n != 1 {
+				t.Errorf("an outage cost %d group lookups, want 1 (the name kept)", n)
+			}
+			if _, ok := c.names["g@d.example"]; !ok {
+				t.Error("an outage evicted the cached name")
+			}
+		})
+	}
+}
+
+// Concurrent checks that all read the stale name each cost at most one
+// extra lookup.
+func TestGroupsStaleNameConcurrent(t *testing.T) {
+	t.Parallel()
+	d := &recreatableDirectory{current: "groups/old", goneStatus: http.StatusForbidden, transitive: true}
+	srv := d.server(t)
+	c := &CloudIdentityGroups{Client: srv.Client(), Endpoint: srv.URL + "/"}
+	ctx := context.Background()
+	if ok, err := c.IsMember(ctx, "g@d.example", "in@d.example"); err != nil || !ok {
+		t.Fatalf("first check = %v, %v", ok, err)
+	}
+	d.recreate("groups/new")
+	const n = 16
+	var wg sync.WaitGroup
+	for range n {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			if ok, err := c.IsMember(ctx, "g@d.example", "in@d.example"); err != nil || !ok {
+				t.Errorf("concurrent check after recreation = %v, %v; want true", ok, err)
+			}
+		}()
+	}
+	wg.Wait()
+	if got := d.lookups.Load() - 1; got < 1 || got > n {
+		t.Errorf("%d concurrent checks cost %d lookups, want 1..%d", n, got, n)
+	}
+}
+
+// forgetName leaves a name that a concurrent check has already refreshed.
+func TestGroupsForgetNameKeepsRefreshed(t *testing.T) {
+	t.Parallel()
+	c := &CloudIdentityGroups{names: map[string]cached[string]{"g@d.example": {v: "groups/new"}}}
+	c.forgetName("g@d.example", "groups/old")
+	if e, ok := c.names["g@d.example"]; !ok || e.v != "groups/new" {
+		t.Errorf("forgetName of a stale name evicted the fresh one: %v, %v", e, ok)
+	}
+	c.forgetName("g@d.example", "groups/new")
+	if _, ok := c.names["g@d.example"]; ok {
+		t.Error("forgetName left the name it was asked to drop")
+	}
+}

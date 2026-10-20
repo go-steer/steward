@@ -99,10 +99,25 @@ Who is let in, decided after verification:
   that should be ported back: a member address with a quote or backslash
   is matched exactly by the walk instead of being stripped into the
   transitive call's quoted query (kode-gopher's stripping let `o'brien`
-  match `obrien`); a 404 on a cached group name looks the group up again
-  before it counts as "not a member" (a group deleted and recreated within
-  the hour would otherwise refuse its members); and a group's member
-  listing is capped at 100 pages.
+  match `obrien`); a cached group name (kept for an hour) that draws a 403
+  or 404 about the group itself looks the group up again and asks once
+  more before the answer counts; and a group's member listing is capped
+  at 100 pages. A group deleted and recreated within the hour has a new
+  name, and Cloud Identity may answer the old one with 403 "Permission
+  denied ... (or it may not exist)" instead of 404 (AIP-211's wording for
+  not leaking existence). On the transitive call a 403 is also the edition
+  signal, so a cached name's 403 there still falls back to the walk, and
+  it is the walk's 403 or 404 on the group's own listing (or the
+  transitive call's 404) that marks the name stale. On a freshly looked-up
+  name the usual meanings apply: the transitive call's 404 is "not a
+  member", its 403 is the edition fallback (cached per resource name, so a
+  new name gets its own decision), and a walk that cannot list the group
+  is an error. A 5xx or 429 never marks a name stale, and a check costs at
+  most one extra `groups:lookup`. Two limits remain: a membership list
+  cached under the old name (5 minutes) answers as the old group did, and
+  a nested group's stale name is not retried, so any account the walk does
+  not match elsewhere gets an error rather than a "no" until that name
+  expires.
 - Group membership is matched by email, as Cloud Identity keys it. Like an
   exact-email entry, and unlike a domain entry, a group entry admits any
   Google account verified for a member's address.
