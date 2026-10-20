@@ -8,6 +8,12 @@ exported API" in [`CONTRIBUTING.md`](./CONTRIBUTING.md)).
 
 ## [Unreleased]
 
+*Nothing yet.*
+
+## [0.3.0] - 2026-10-20
+
+Outages answer 503, not 401, and the CIMD fetch filter is closed against zoned IPv6 literals. steward now requires purser v0.3.0 (purser#23): Google, group-directory and sealing-key outages reach a `Protector`'s callers as 503 with `Retry-After`, so MCP clients retry instead of signing in again. The purser bump reaches consumers through MVS and changes their own `httpmw.CallerMiddleware` too (see Changed). The security fix closes an SSRF in `SSRFSafeClient` (#12).
+
 ### Security
 
 - **`SSRFSafeClient` refuses zoned IPv6 addresses.** `netip.Prefix.Contains`
@@ -247,6 +253,7 @@ come later.
   adversarial-review gate and agent-attribution check follow purser and
   supercargo. No exported API yet.
 
-[Unreleased]: https://github.com/go-steer/steward/compare/v0.2.0...HEAD
+[Unreleased]: https://github.com/go-steer/steward/compare/v0.3.0...HEAD
+[0.3.0]: https://github.com/go-steer/steward/releases/tag/v0.3.0
 [0.2.0]: https://github.com/go-steer/steward/releases/tag/v0.2.0
 [0.1.0]: https://github.com/go-steer/steward/releases/tag/v0.1.0
