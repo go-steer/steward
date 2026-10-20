@@ -17,4 +17,4 @@
 # sit behind the new baseline, and a leftover entry would silently permit
 # a second, unrelated removal of a symbol that no longer exists.
 #
-# (empty — nothing has been broken since v0.2.0)
+# (empty — nothing has been broken since v0.3.0)
