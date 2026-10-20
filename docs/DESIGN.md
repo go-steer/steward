@@ -26,7 +26,7 @@ one caller type however the caller arrived.
 | Consumer | Uses | Status |
 |---|---|---|
 | go-steer/k8s-lookout | Path A: Gemini Enterprise users read clusters as themselves (k8s-lookout#699); Path B: generic MCP clients sign in through steward's authorization server (k8s-lookout#702) | Path A on v0.1.0; Path B on v0.2.0 |
-| go-steer/supercargo | Path A: the source of `googletoken`; adopting steward would replace its `internal/googleauth` | deferred (2026-10-15): supercargo stays as it is for now; port fixes by hand |
+| go-steer/supercargo | Path A: the source of `googletoken`; adopting steward would replace its `internal/googleauth` | not planned (2026-10-20): supercargo keeps its own `internal/googleauth`; port fixes by hand |
 
 ## Path A — the client holds the user's token
 
@@ -196,12 +196,15 @@ metadata but not the scopes.
 
 ### Browser sign-in (`signin`)
 
-supercargo's server-side code flow (PKCE, state and nonce, ID-token check)
-comes along because supercargo's browser UI uses it. Whether the ID token
-is verified with purser's `authn/oidc` (go-jose, already a purser
-dependency) or `cloud.google.com/go/auth/credentials/idtoken` (what
-supercargo uses today, a much larger dependency tree) is decided in that
-package's PR; purser's verifier is preferred if it can check the nonce.
+**Deferred: no consumer.** supercargo's server-side code flow (PKCE, state
+and nonce, ID-token check) was to come along because supercargo's browser
+UI uses it, and supercargo is not moving to steward (2026-10-20). Path B's
+`authserver` runs its own Google sign-in and needs nothing from here. If a
+consumer appears: whether the ID token is verified with purser's
+`authn/oidc` (go-jose, already a purser dependency) or
+`cloud.google.com/go/auth/credentials/idtoken` (what supercargo uses, a
+much larger dependency tree) is decided in that package's PR; purser's
+verifier is preferred if it can check the nonce.
 
 ## Path B — the service is its own authorization server
 
@@ -537,6 +540,6 @@ limit). Ported tests keep their supercargo coverage.
 | 1 | The two purser additions | done: purser v0.2.0 |
 | 2a | Path A verification: `googletoken`, `allow` (emails, domains) | done: steward#3 |
 | 2b | Path A wiring: `httpauth`, `mcpauth`; tag v0.1.0 | done: steward#4, v0.1.0 |
-| 3 | k8s-lookout adopts v0.1.0 (supercargo deferred) | k8s-lookout#699 |
-| 4 | `allow` groups; `signin` | groups: done (steward#6); `signin`: steward#1 |
+| 3 | k8s-lookout adopts v0.1.0 (supercargo not planned) | done: k8s-lookout#699 |
+| 4 | `allow` groups; `signin` | groups: done (steward#6); `signin`: deferred, no consumer |
 | 5 | Path B: `seal`, `authserver`, both paths in `httpauth` and `mcpauth`; tag v0.2.0 | done: steward#6, #7, #8, #9, v0.2.0 (k8s-lookout#702) |
