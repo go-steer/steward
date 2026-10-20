@@ -342,7 +342,7 @@ func permanentFetchError(err error) bool {
 	var unknownCA x509.UnknownAuthorityError
 	var hostname x509.HostnameError
 	var invalid x509.CertificateInvalidError
-	return errors.Is(err, errNonPublic) || (errors.As(err, &dns) && dns.IsNotFound) ||
+	return errors.Is(err, errNonPublic) || errors.Is(err, errRedirect) || (errors.As(err, &dns) && dns.IsNotFound) ||
 		errors.As(err, &cert) || errors.As(err, &unknownCA) || errors.As(err, &hostname) || errors.As(err, &invalid)
 }
 
@@ -405,7 +405,7 @@ func SSRFSafeClient(timeout time.Duration) *http.Client {
 			TLSHandshakeTimeout: timeout,
 		},
 		CheckRedirect: func(*http.Request, []*http.Request) error {
-			return errors.New("redirects aren't followed")
+			return errRedirect
 		},
 	}
 }
@@ -413,29 +413,49 @@ func SSRFSafeClient(timeout time.Duration) *http.Client {
 // errNonPublic is SSRFSafeClient refusing an address.
 var errNonPublic = errors.New("refusing to dial non-public address")
 
+// errRedirect is SSRFSafeClient refusing to follow a redirect, which a
+// retry will not change.
+var errRedirect = errors.New("redirects aren't followed")
+
 // nonPublic are special-purpose ranges that IsGlobalUnicast admits but a
 // client-supplied URL must not reach: "this network", shared address
 // space, IETF protocol assignments, benchmarking, the 6to4 relay anycast,
-// reserved space, documentation, and the IPv6 prefixes that embed an IPv4
-// address (IPv4-compatible, SIIT, NAT64, Teredo and the rest of the IETF
-// block, 6to4): NAT64's 64:ff9b::a9fe:a9fe reaches 169.254.169.254.
+// reserved space, documentation (IPv4 and IPv6), deprecated IPv6
+// site-local, IPv6 discard-only and SRv6 SIDs, and the IPv6 prefixes that embed an IPv4 address
+// (IPv4-compatible, SIIT, NAT64, Teredo and the rest of the IETF block,
+// 6to4): NAT64's 64:ff9b::a9fe:a9fe reaches 169.254.169.254. A NAT64
+// network-specific prefix (RFC 6052) is the operator's choice and cannot
+// be listed here; refusing it is egress policy.
 var nonPublic = []netip.Prefix{
 	netip.MustParsePrefix("0.0.0.0/8"),
 	netip.MustParsePrefix("100.64.0.0/10"),
 	netip.MustParsePrefix("192.0.0.0/24"),
+	netip.MustParsePrefix("192.0.2.0/24"),
 	netip.MustParsePrefix("192.88.99.0/24"),
 	netip.MustParsePrefix("198.18.0.0/15"),
+	netip.MustParsePrefix("198.51.100.0/24"),
+	netip.MustParsePrefix("203.0.113.0/24"),
 	netip.MustParsePrefix("240.0.0.0/4"),
 	netip.MustParsePrefix("::/96"),
 	netip.MustParsePrefix("::ffff:0:0:0/96"),
+	netip.MustParsePrefix("100::/64"),
 	netip.MustParsePrefix("64:ff9b::/96"),
 	netip.MustParsePrefix("64:ff9b:1::/48"),
 	netip.MustParsePrefix("2001::/23"),
 	netip.MustParsePrefix("2001:db8::/32"),
 	netip.MustParsePrefix("2002::/16"),
+	netip.MustParsePrefix("3fff::/20"),
+	netip.MustParsePrefix("5f00::/16"),
+	netip.MustParsePrefix("fec0::/10"),
 }
 
 func isPublic(ip netip.Addr) bool {
+	// A zone means something only on a link-local address, never a public
+	// one, and Prefix.Contains is false for any zoned address, so a zone
+	// would slip an address past every range below.
+	if ip.Zone() != "" {
+		return false
+	}
 	ip = ip.Unmap()
 	if !ip.IsGlobalUnicast() || ip.IsPrivate() {
 		return false

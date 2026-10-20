@@ -266,6 +266,57 @@ func TestIsPublicMoreRanges(t *testing.T) {
 	}
 }
 
+// A zoned address is never public: Prefix.Contains is false for any zone,
+// so without the check a zone slips a special-purpose address past every
+// range (https://[64:ff9b::a9fe:a9fe%25eth0]/c.json reached NAT64).
+func TestIsPublicZoned(t *testing.T) {
+	t.Parallel()
+	for _, a := range []string{"64:ff9b::a9fe:a9fe%eth0", "2002:a9fe:a9fe::1%lo", "::a9fe:a9fe%x", "2001:db8::1%x", "2606:4700::1%1"} {
+		if isPublic(netip.MustParseAddr(a)) {
+			t.Errorf("isPublic(%s) = true", a)
+		}
+	}
+	if !isPublic(netip.MustParseAddr("2606:4700::1")) {
+		t.Error("isPublic(2606:4700::1) = false")
+	}
+}
+
+// Through the real dialer: the zone reaches the dialer's Control, which
+// refuses before connecting, so this needs no network.
+func TestCIMDZonedURLRefused(t *testing.T) {
+	t.Parallel()
+	_, err := newCIMDFetcher(nil).fetch(context.Background(), "https://[64:ff9b::a9fe:a9fe%251]/c.json")
+	if !errors.Is(err, errNonPublic) || errors.Is(err, errCIMDUnavailable) {
+		t.Errorf("zoned NAT64 CIMD URL: %v, want refused as non-public and unknown", err)
+	}
+}
+
+func TestIsPublicDocumentationAndSiteLocal(t *testing.T) {
+	t.Parallel()
+	for _, a := range []string{"192.0.2.1", "198.51.100.1", "203.0.113.1", "3fff::1", "fec0::1", "100::1", "5f00::1"} {
+		if isPublic(netip.MustParseAddr(a)) {
+			t.Errorf("isPublic(%s) = true", a)
+		}
+	}
+}
+
+// A CIMD host that redirects is an unknown client, not unavailable:
+// redirects are never followed, so a retry cannot help.
+func TestCIMDRedirectIsPermanent(t *testing.T) {
+	t.Parallel()
+	hc := SSRFSafeClient(time.Second)
+	hc.Transport = roundTripFunc(func(*http.Request) (*http.Response, error) {
+		rec := httptest.NewRecorder()
+		rec.Header().Set("Location", "https://elsewhere.example/c.json")
+		rec.WriteHeader(http.StatusFound)
+		return rec.Result(), nil
+	})
+	_, err := newCIMDFetcher(hc).fetch(context.Background(), "https://x.example/c.json")
+	if err == nil || errors.Is(err, errCIMDUnavailable) || !errors.Is(err, errRedirect) {
+		t.Errorf("redirecting CIMD host: %v, want refused as a redirect and unknown", err)
+	}
+}
+
 func TestDomainScopedAuthProvider(t *testing.T) {
 	t.Parallel()
 	c := goodConfig(t)
