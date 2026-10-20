@@ -50,14 +50,17 @@ var ErrNotAdmitted = fmt.Errorf("%w: account not admitted", ErrInvalid)
 // token, an unadmitted account and an unavailable Google are all errors.
 // What happens next is purser's middleware's decision, and only one
 // configuration keeps steward's "no fallback identity" rule: Enforce set
-// and no Fallback, so every failure is a 401. With Enforce off, purser
+// and no Fallback, so every failure is refused. With Enforce off, purser
 // gives a failed request CallerOptions.Fallback, so a Fallback naming the
 // service would serve unadmitted people as the service. Use
 // httpmw.CallerOptions{Authenticator: a, Enforce: true}.
 //
-// Under Enforce an unavailable Google is also a 401: purser maps every
-// authentication error to one. Configure Config.Logger on the Verifier so
-// an outage is visible.
+// Under Enforce, purser answers a rejected credential (no token,
+// ErrInvalid, ErrNotAdmitted) with 401 and the challenge, and an
+// unavailable Google or a failed group lookup (ErrUnavailable) with 503
+// and Retry-After, so a client keeps its token and retries instead of
+// signing in again. purser logs every such 503 at Warn through
+// CallerOptions.Logger.
 type Authenticator struct {
 	v     *Verifier
 	admit *allow.Admitter

@@ -245,7 +245,7 @@ func TestAttachUnavailableIs503(t *testing.T) {
 	r = r.WithContext(purser.WithAuthSource(r.Context(), purser.AuthSourceGoogleAccessToken))
 	rec := httptest.NewRecorder()
 	h.ServeHTTP(rec, r)
-	if rec.Code != http.StatusServiceUnavailable || rec.Header().Get("Retry-After") == "" || ran {
+	if rec.Code != http.StatusServiceUnavailable || rec.Header().Get("Retry-After") != retryAfter || ran {
 		t.Errorf("Google down in attach: %d, Retry-After %q, handler ran %v; want 503", rec.Code, rec.Header().Get("Retry-After"), ran)
 	}
 }

@@ -38,8 +38,10 @@ import (
 var ErrInvalidToken = fmt.Errorf("authserver: invalid access token: %w", purser.ErrUnauthenticated)
 
 // ErrUnavailable is the sealing keys being unavailable, so no token can be
-// checked right now. It does not wrap purser.ErrUnauthenticated.
-var ErrUnavailable = errors.New("authserver: tokens cannot be verified right now")
+// checked right now. It wraps purser.ErrUnavailable and not
+// purser.ErrUnauthenticated, so purser's enforced middleware answers 503
+// with Retry-After rather than 401.
+var ErrUnavailable = fmt.Errorf("authserver: tokens cannot be verified right now: %w", purser.ErrUnavailable)
 
 // Labels set on the purser.Caller for an access token.
 const (

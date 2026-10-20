@@ -93,10 +93,11 @@ const (
 var ErrInvalid = fmt.Errorf("googletoken: invalid token: %w", purser.ErrUnauthenticated)
 
 // ErrUnavailable is Google failing to answer (no response, 429, 5xx) or
-// this Verifier shedding load (MaxLookups in flight). It is never cached
-// and does not wrap purser.ErrUnauthenticated: the token may be fine, and
-// a retry may succeed.
-var ErrUnavailable = errors.New("googletoken: Google could not verify the token right now")
+// this Verifier shedding load (MaxLookups in flight). It is never cached.
+// It wraps purser.ErrUnavailable and not purser.ErrUnauthenticated: the
+// token may be fine and a retry may succeed, so purser's enforced
+// middleware answers 503 with Retry-After rather than 401.
+var ErrUnavailable = fmt.Errorf("googletoken: Google could not verify the token right now: %w", purser.ErrUnavailable)
 
 // Identity is who a verified token belongs to.
 type Identity struct {
@@ -133,9 +134,10 @@ type Config struct {
 	HTTPClient *http.Client
 
 	// Logger receives one warning per ErrUnavailable, without the token.
-	// Behind purser's enforced middleware every failed authentication is a
-	// plain 401, so this line is how an operator tells a Google outage from
-	// a wave of bad tokens. Nil means no logging.
+	// It is optional behind purser's middleware, which answers an
+	// ErrUnavailable with 503 and logs it at Warn itself, through
+	// CallerOptions.Logger or else slog.Default(): setting this as well
+	// logs every outage twice. Nil means no logging.
 	Logger *slog.Logger
 
 	// TokenInfoURL and UserInfoURL replace Google's endpoints (tests).

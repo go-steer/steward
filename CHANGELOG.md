@@ -21,11 +21,38 @@ exported API" in [`CONTRIBUTING.md`](./CONTRIBUTING.md)).
   site-local `fec0::/10`, IPv6 discard-only `100::/64` and SRv6's
   `5f00::/16`.
 
+### Changed
+
+- **steward requires purser v0.3.0, which changes your own purser
+  middleware too.** Go's minimum version selection gives a service that
+  imports steward purser v0.3.0, so every `httpmw.CallerMiddleware` it
+  builds changes along with steward's: under `Enforce`, only an error
+  wrapping `purser.ErrUnauthenticated` is a 401, and anything else is a 503
+  with `Retry-After`. An authenticator of yours that reports a bad
+  credential with a bare error, not wrapping `ErrUnauthenticated`, now
+  draws a 503 and an invitation to retry instead of a 401. Check yours
+  before upgrading; see "Check before upgrading" in purser's
+  [v0.3.0 changelog](https://github.com/go-steer/purser/blob/v0.3.0/CHANGELOG.md).
+  purser v0.3.0 also logs through `CallerOptions.Logger` (else
+  `slog.Default()`): a Warn for every 503 and a Debug for every 401.
+
 ### Fixed
 
 - **A CIMD host that redirects is an unknown client.** `authserver` gave
   it the 503 page or `server_error` ("try again"), though redirects are
   never followed and a retry cannot help.
+- **An outage is a 503, not a 401 (purser#23).** steward requires purser
+  v0.3.0, and `googletoken.ErrUnavailable` (Google not answering, 429, 5xx,
+  load shed, a failed allow-list group lookup) and
+  `authserver.ErrUnavailable` (sealing keys unavailable) now wrap
+  `purser.ErrUnavailable`. Through a `Protector`, a Google, directory or key
+  outage answers 503 with `Retry-After` and no challenge, so MCP clients
+  retry with the credential they have instead of signing in again. Bad and
+  disallowed credentials are still 401. `errors.Is` against the steward
+  sentinels is unchanged; their messages now end with purser's. The
+  `Protector`'s own 503, for a token that became uncheckable between
+  purser's layer and the attach layer, sends `Retry-After: 10` as purser
+  does, instead of 5.
 
 ## [0.2.0] - 2026-10-17
 

@@ -114,10 +114,17 @@ removal takes effect within 10 minutes (a verdict computed from a
 membership list cached for 5). Any group admits; a group that cannot be
 checked does not lock out the members of the others, and only when nothing
 matched is a failure the answer: an error (on Path A, `ErrUnavailable`),
-never cached and never a refusal. Under purser's enforced middleware that
-error is still a 401 on the wire, including a permanent one such as a
-nested group from an external identity source; `Config.Logger` on the
-Verifier is how an operator sees it. `googletoken.NewAuthenticator` refuses
+never cached and never a refusal. Under purser's enforced middleware
+(v0.3.0 and later) that error is a 503 with `Retry-After`, not a 401, so
+the client keeps its token and retries. The trade-off: a lookup that fails
+for a permanent reason, such as a nested group from an external identity
+source, is a 503 that clients keep retrying until an operator fixes the
+cause; it never becomes a 401. An operator sees it as purser's Warn line
+("authenticator could not reach a verdict") on every such request, written
+to `httpauth.Options.Logger` or `slog.Default()`, plus the Authenticator's
+own Warn when the Verifier has a `Config.Logger`. An account in no listed
+group is a 401 only once every group has answered.
+`googletoken.NewAuthenticator` refuses
 a list with group entries, which it could not look up;
 `NewAdmittingAuthenticator` takes an `Admitter`.
 
@@ -134,13 +141,18 @@ An empty list admits no one.
   a Fallback naming the service would serve unadmitted people as the
   service, which breaks "no fallback identity". `httpauth` builds the
   middleware itself, so a consumer cannot get this wrong through steward.
-- **Under `Enforce`, an unavailable Google is a 401 too.** purser maps every
-  authentication error to 401 and logs none of them, so a Google outage
-  looks like a wave of bad tokens, and MCP clients typically answer a 401
-  by signing in again. Until purser has a 503 path for errors that do not
-  wrap `ErrUnauthenticated` (purser#23), `googletoken.Config.Logger`
-  logs every `ErrUnavailable`, without the token, so an operator can tell
-  the two apart.
+- **Under `Enforce`, an unavailable Google is a 503 with `Retry-After`.**
+  `googletoken.ErrUnavailable` and `authserver.ErrUnavailable` wrap
+  `purser.ErrUnavailable`, which purser's enforced middleware answers with
+  503 and a Warn log line since purser v0.3.0 (purser#23). A client keeps
+  its credential and retries, rather than signing in again for a token that
+  may be fine, which an MCP client does on a 401. A rejected credential
+  (no token, `ErrInvalid`, `ErrNotAdmitted`, `authserver.ErrInvalidToken`)
+  is still a 401 with the challenge. purser writes its Warn line to
+  `httpauth.Options.Logger`, or `slog.Default()` when that is nil, so it is
+  always on; `googletoken.Config.Logger` still logs every `ErrUnavailable`
+  without the token, and is optional: setting it at all gives two lines per
+  outage request, whether or not `Options.Logger` is set.
 - An `httpauth.Protector` builds that middleware itself and wraps it
   around a second layer that attaches the verified token as an
   `oauth2.TokenSource` (`httpauth.TokenSourceFromContext`) and its
@@ -459,9 +471,11 @@ optional: at least one of them). The Protector then:
   403 with `error="insufficient_scope"`, which starts a client's step-up.
   Google tokens carry no service scopes and are not held to them; on Path
   A the service's own rules decide.
-- **Answers 503** if the keys vanish between the two layers, as for a
-  Google outage on Path A. (Before that, purser's middleware maps every
-  authentication error, an unavailable key store included, to 401.)
+- **Answers 503** with `Retry-After` if the keys vanish between the two
+  layers, as for a Google outage on Path A. (Keys already unavailable when
+  the request arrives are a 503 from purser's middleware, before this
+  layer: `authserver.ErrUnavailable` wraps `purser.ErrUnavailable`.) Both
+  layers send the same `Retry-After`, 10 seconds.
 
 `mcpauth.TokenInfo` builds the SDK `TokenInfo` from the `Principal` for a
 steward token: `UserID` is the Google `sub` for a person, the same as on
