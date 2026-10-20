@@ -277,8 +277,12 @@ resource serves it (`httpauth`), naming this issuer.
 
 **Clients.** Pre-registered (`StaticClient`, `LoadStaticClients`), DCR
 (the issued `client_id` is the sealed registration) and CIMD (an https
-`client_id`, fetched with `SSRFSafeClient`: public IPs only, no redirects,
-64 KiB, cached per `Cache-Control` up to an hour). DCR and CIMD clients
+`client_id`, fetched with `SSRFSafeClient`: public IPs only (no zoned
+address, and none of the special-purpose ranges `IsGlobalUnicast` admits
+that could reach an internal network; a NAT64 network-specific prefix is
+the operator's choice and a matter for egress policy), no redirects, 64 KiB,
+cached per `Cache-Control` up to an hour). A redirect, like an address the
+filter refuses, is an unknown client, never "unavailable". DCR and CIMD clients
 get a consent page naming the client and its redirect host before Google
 sign-in, because one Google client fronts them all; pre-registered clients
 skip it. The flow is bound to the browser by a random cookie (`__Host-`

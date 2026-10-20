@@ -8,7 +8,24 @@ exported API" in [`CONTRIBUTING.md`](./CONTRIBUTING.md)).
 
 ## [Unreleased]
 
-*Nothing yet.*
+### Security
+
+- **`SSRFSafeClient` refuses zoned IPv6 addresses.** `netip.Prefix.Contains`
+  is false for an address with a zone, so a CIMD `client_id` such as
+  `https://[64:ff9b::a9fe:a9fe%25eth0]/c.json` got past every
+  special-purpose range: an unauthenticated caller could make the
+  authorization server connect to a NAT64, 6to4 or Teredo address that
+  embeds an internal IPv4 one (169.254.169.254, say) on networks that route
+  them. A zoned address is now never public. The filter also refuses the
+  IPv4 documentation ranges, RFC 9637's `3fff::/20`, deprecated IPv6
+  site-local `fec0::/10`, IPv6 discard-only `100::/64` and SRv6's
+  `5f00::/16`.
+
+### Fixed
+
+- **A CIMD host that redirects is an unknown client.** `authserver` gave
+  it the 503 page or `server_error` ("try again"), though redirects are
+  never followed and a retry cannot help.
 
 ## [0.2.0] - 2026-10-17
 
