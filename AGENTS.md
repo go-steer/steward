@@ -126,5 +126,6 @@ refresh-token families) and both token kinds in one `httpauth.Protector`
 and `mcpauth`. `allow`'s group checker, `seal` and `authserver` are taken
 from kode-gopher at `8b53617`, which will not import steward: port fixes
 by hand in both directions (DESIGN.md lists the ones made here).
-supercargo keeps its own `googletoken` copy for now. Later: `signin`. See
-the phase table in [`docs/DESIGN.md`](./docs/DESIGN.md).
+supercargo keeps its own `googletoken` copy and is not moving to steward,
+so `signin` (which only supercargo needed) is deferred until a consumer
+appears. See the phase table in [`docs/DESIGN.md`](./docs/DESIGN.md).
