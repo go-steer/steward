@@ -321,6 +321,28 @@ contents, a dial error naming an internal address) goes to the log only;
 a CIMD host that is down, or our keys being unavailable, is a 503 page or
 `server_error`, not "unknown client".
 
+**Client names.** A DCR or CIMD client chooses its own name, so the
+consent page must not let it pass for something else. The name is cleaned
+wherever a client is resolved or registered, and again at display:
+control and format characters (bidi overrides, embeddings and isolates,
+zero-width characters) and other default-ignorable, private-use and
+unassigned code points are dropped, whitespace runs (line and paragraph
+separators included) become one space, non-spacing and enclosing marks
+are capped at four per character, and the result is cut to 100 bytes on
+a character boundary. Cleaning at resolution covers registrations sealed
+before it existed, and static clients' names (which only reach the log).
+The page calls the client "a client calling itself" its name, in a
+bidi-isolated element (`<bdi>`) of its own, and shows the CIMD client ID
+and the redirect host in separate elements as printable ASCII (anything
+else percent-encoded, since `url.Parse` keeps non-ASCII and decodes a
+host's escapes), so no name can reorder them. A DCR client, whose client
+ID is a sealed blob, gets a line saying it registered itself and nothing
+vouches for its name, so a fake "(https://...)" in a name still reads as
+the client's claim, not as a client ID line. `html/template` escapes
+markup but passes these characters through, so the cleaning is ours.
+Blank but visible characters (U+2800, say) survive: they can pad a name,
+not reorder or hide anything; nor is a homoglyph name caught.
+
 **Authorization requests.** `response_type=code`, PKCE with S256 only
 (the verifier is RFC 7636's 43 to 128 unreserved characters), and a
 `resource` (RFC 8707) that, if present, must be `Config.Resource` (one
@@ -446,9 +468,11 @@ and other special-purpose ranges; flow cookies are `__Host-` where
 possible; client secrets are compared by digest; a static client's
 redirect URIs are validated at load and its slices copied; Google's
 endpoints must be https; the keys being unavailable is `server_error`,
-never `invalid_grant`; and the consent page's text is the service's
-(`ServiceName`). Scopes are granted in the configuration's order, so a
-grant reads the same however the client ordered its request.
+never `invalid_grant`; the consent page's text is the service's
+(`ServiceName`); and a client's name there is cleaned and kept apart from
+its client ID and redirect host (see Client names above). Scopes are
+granted in the configuration's order, so a grant reads the same however
+the client ordered its request.
 
 ### Both paths on one resource (`httpauth`, `mcpauth`)
 
