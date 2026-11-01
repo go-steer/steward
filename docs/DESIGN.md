@@ -435,35 +435,209 @@ sealed in the refresh token are stale.
   signed-in user's (the vault stores whichever account consented, under
   whatever user ID it is given, and has no delete API), it must carry
   every configured Google scope, and its expiry is tokeninfo's, never the
-  vault's `expireTime`. A token with under 5 minutes left, or one
-  tokeninfo refuses (400 `invalid_token`: expired early or revoked), is
-  force-refreshed once. The vault's API reference says a forced refresh
-  "fetches a new token or initiates a new consent flow". For a refused
-  token, a consent request is the grant gone: sign-in detours through
-  consent, refresh is `invalid_grant`. For a token Google still accepts it
-  is not: the vault declines to force-refresh a valid token by asking for
-  consent (kode-gopher's vault spike). So when forcing a valid token
-  brings no better one, short of a refusal, that token is used if it has 3
-  minutes left (enough for an access token that stops a minute before it,
-  after a code that may wait a minute), and the answer is otherwise
-  `server_error`.
+  vault's `expireTime`. Renewal follows the vault's own rules (below):
+  only a token tokeninfo refuses is force-refreshed, a token Google still
+  accepts is used for as long as it lasts, and one too close to expiry to
+  use is waited out and retrieved again.
 - `SealedCustody`: the Google refresh token rides inside steward's sealed
   refresh token.
+
+**Vault renewal.** The evidence:
+
+- The vault's API reference (discovery document, revision 20261016) on
+  `forceRefreshToken`: "Set this field only if the previous token was
+  expired or invalid. ... Setting this field triggers a refresh of the
+  access token with a stored refresh token, if possible, or a new consent
+  flow." On `Success.token`: on a `PERMISSION_DENIED`, retry "with
+  force_refresh_token set to the expired/invalid token string, which will
+  fetch a new token or initiate a new consent flow".
+- kode-gopher's vault spike (2026-09-30, `docs/design-in-cluster.md`,
+  phase B): forcing a refresh of a still-valid token returned
+  `uriConsentRequired`; after the hour-long token expired, a plain
+  `retrieve` "silently returned a fresh token for the same `sub`", and a
+  forced one minted another, with no consent; `expireTime` was once 4
+  hours out when tokeninfo said 1.
+
+So steward forces a refresh only for a token tokeninfo refuses (400 with
+`error` `invalid_token`, which is also how an expired token answers), and
+never for one Google still accepts. Asked to force a valid token, the
+vault asked for consent, an answer that brings no token and says nothing
+about the grant. steward used to force tokens with under 5 minutes left,
+as kode-gopher does, and then (#20) to fall back to the valid token when
+the vault asked for consent; this policy leaves that fallback unreachable,
+and it is gone. A valid token is used if it has `need` left: at
+refresh 75 seconds (an access token of at least 15 seconds, stopping a
+minute before the Google token); at sign-in 90 seconds, allowing the
+authorization code 15 seconds to be exchanged. Clients exchange within a
+second or two; one that waits longer (`CodeTTL` allows a minute) may get
+`server_error` at the exchange and start again, as it would have at the
+redirect had the token been held back. Its access token stops a minute
+before it, as always.
+
+A token with less than `need` left can only be renewed by expiring.
+steward waits it out (its remaining life plus 3 seconds, cancelled with
+the request: at most 78 seconds at refresh, 93 at sign-in) and asks the
+vault again, plainly: a fresh token is used; the expired token handed back
+is refused by tokeninfo and forced, which the reference allows.
+
+Consent to a forced refresh is checked once more with a plain retrieve
+before it counts: another client of the same person may have forced the
+same expired token a moment earlier, and the vault may refuse the stale
+second force. A token other than the forced one that tokeninfo accepts
+with `need` left goes on to the full checks (account, scopes, email) and
+is used if it passes; anything else (consent again, pending, the same
+token, a refused or short one) leaves the verdict, and failing to ask
+(the vault or tokeninfo failing) is `server_error`. If the verdict stands and
+the forced token is the one this request waited out, a refresh gets
+`server_error`, not yet a sign-out, in case the vault lags tokeninfo by a
+few seconds in counting the token expired; the next request does not wait,
+forces the expired token again, and reads consent as the grant gone. A
+sign-in detours through consent, as for any other consent request. This
+does not protect against a vault that judged "expired" by its own
+`expireTime` (once 4 hours out) and so answered every forced refresh of a
+spent token with consent: refreshes would then still sign people out
+hourly, one request later. The live check below (how soon after expiry
+the vault renews) settles it.
+
+steward waits once. A token still short after the wait, or one a forced
+refresh brought, is `server_error` at once.
+
+The wait matters because an active client's refresh lands exactly in that
+window: its access token stopped a minute before the Google token, so it
+refreshes when the Google token has a minute left. Answering that refresh
+with `server_error`, as steward did when the vault would not force (from 3
+minutes left), is not a cheap back-off: the MCP TypeScript SDK
+(`client/auth.js` in 1.25.3) treats a `server_error` at refresh by
+starting a new interactive authorization, so it would mean a browser
+sign-in every hour. A client that refreshes whenever its access token has
+less than some margin left refreshes on each request while the capped
+access token stays inside that margin (one vault retrieve, one tokeninfo
+and one rotation per refresh, at the client's own pace) until the wait
+ends it; forcing had the same loop, with two vault calls per refresh from
+5 minutes left.
+
+**Ordering at refresh.** The wait runs before the refresh token's family
+is rotated, through the sealed `Custody` interface's `prepare` step,
+which the token endpoint calls first. A refresh:
+
+1. opens and checks the refresh token (expiry, client, resource, scopes);
+2. `prepare`: under `VaultCustody`, all the vault work, the wait
+   included: retrieve, tokeninfo (account, scopes, email, life), the wait
+   and the second retrieve, a forced refresh of a refused token. Nothing
+   is rotated yet, so a failure (the vault or Google failing, the client
+   going away) is `server_error` with nothing to give back.
+   `SealedCustody` does nothing here;
+3. rotates the family (reuse detection, the grace);
+4. checks the allow-list;
+5. answers a refusal from step 2 (`errReauth`) with `invalid_grant`, after
+   the rotation, so the token stays spent and a replayed generation still
+   revokes its family;
+6. issues the grant step 2 prepared, the token every check was made on,
+   with no second vault call. (Under `SealedCustody` the Google refresh
+   happens here, after reuse detection, as before: it is quick, and a
+   refresh token Google rotates is never lost to a refresh that is then
+   refused.)
+
+What this ordering means:
+
+- **Concurrent refreshes.** Two processes of one client presenting the
+  same refresh token while the token is nearly spent both wait, side by
+  side, and rotate moments apart. Within `RefreshReuseGrace` the loser is
+  refused without revoking and can re-read the winner's tokens from the
+  shared store. Without a grace it revokes the family, as any concurrent
+  refresh does; that is #18's trade-off, unchanged. The grace need not
+  cover the wait as long as a refresh arriving during another's wait also
+  gets the nearly spent token and waits too. If the vault renews early
+  (before expiry, unverified), a later arrival can get a fresh token at
+  once and rotate while the first still waits, and the first then loses
+  the race by up to the rest of its wait: outside a short grace it revokes
+  the family. If both force the same expired token, the vault may refuse
+  the second ("not the latest token", or consent, which is checked again
+  as above): `server_error` at worst, nothing rotated, and the retry finds
+  the fresh token.
+- **The client going away, or a front end timing out, during the wait.**
+  Nothing is rotated, so nothing is given back and the retry, on any
+  replica, works: no sign-out in steward's state. But a proxy's 504 is not
+  an OAuth error, and an MCP client may answer it with a browser sign-in,
+  so give the token endpoint, the sign-in callback and the consent return
+  a front-end timeout of at least 2 minutes (78 or 93 seconds of wait plus
+  the vault, tokeninfo and allow-list calls). Common defaults are shorter
+  (a Google Cloud load balancer's backend timeout is 30 seconds, nginx's
+  `proxy_read_timeout` and an AWS ALB's idle timeout 60); kode-gopher's
+  GKE Gateway allows 900 seconds.
+- **`http.Server.WriteTimeout` shorter than the wait.** Over HTTP/1.1 a
+  write timeout does not cancel the request, so a refresh that waited and
+  then rotated would have lost its answer, and the retry would be a
+  replay. Before waiting, custody moves the response's write deadline
+  past the wait plus 30 seconds (`http.ResponseController`), on the token
+  endpoint, the sign-in callback and the consent return, and the token
+  endpoint moves it 30 seconds past the rotation again, so slow vault
+  calls after the wait cannot use it up (with a `WriteTimeout` under 30
+  seconds, every refresh, waited or not, gets those 30 seconds). It only ever moves the server's
+  own deadline (`WriteTimeout` from the request's start) later: without a
+  `WriteTimeout` it sets none, and it never shortens a longer one. A
+  `ResponseWriter` wrapped by middleware without `Unwrap` cannot be
+  extended; there, keep `WriteTimeout` above 2 minutes.
+- **Shutdown or a pod killed mid-wait.** Nothing is rotated until the wait
+  is over. `Shutdown` lets the handler finish (rotate and answer); a kill
+  leaves nothing to give back. Only the moment between the rotation and
+  the answer remains, as for every refresh.
+- **A replayed token** gets the vault work, wait included, before the
+  rotation detects the replay and revokes the family. That costs vault
+  calls, never a token: nothing is issued for it. But reuse detection now
+  needs the vault and Google up: while either fails (or answers
+  `pending`, or the request is cancelled), a replayed or revoked-family
+  token gets `server_error`, with no revocation and no "reused" log line,
+  until a request gets past `prepare`; and a client looping on a revoked
+  token costs a vault retrieve and a tokeninfo call per attempt rather
+  than a replay-cache lookup. A replay-cache peek before `prepare` (an
+  optional interface) would restore both; it is left for a follow-up.
+- **The grant ages** between step 2 and step 6 by the rotation and the
+  allow-list check: a token prepared with 75 seconds left has 15 seconds
+  of margin before the access token would be born expired, which
+  `sealAccess` refuses (`server_error`, the rotation given back).
+
+Tested live on 2026-11-01 (kode-gopher v0.4.0, vault custody): the user
+removed the app's access at myaccount.google.com/connections and then
+signed in again four times over about 5 minutes. Every sign-in completed
+and the vault's token worked against Cloud Storage as that user: revoking
+through myaccount did not invalidate the vault's grant within minutes. So
+a token tokeninfo refuses, forced, then consent meaning the grant is gone
+was not exercised, and that reading remains the reference's, unverified.
+A later attempt could revoke the vault's token directly through Google's
+OAuth revoke endpoint.
+
+Not yet seen live, and what a check on the real vault should settle:
+what a plain `retrieve` returns for a valid token with 5 minutes, 1
+minute and 10 seconds left (the same token, or a fresh one early: if
+fresh, the wait never happens); how soon after tokeninfo's expiry a plain
+`retrieve` renews (immediately, or only at the vault's own `expireTime`,
+in which case the forced refresh of the expired token does it); whether
+forcing a valid token near expiry (1 minute left) also asks for consent;
+whether a consent answer to a forced valid token leaves a plain
+`retrieve` working; what forcing a revoked token returns (consent, as
+the reference implies); and whether a forced refresh of a token another
+caller has just force-refreshed is refused or asks for consent.
 
 A grant only the user can repair is `access_denied` at sign-in and
 `invalid_grant` at refresh (the client signs the person in again): consent
 declined, another account's grant, a missing scope, a changed email,
 Google's `invalid_grant` on a sealed refresh token, and a vault token
 tokeninfo refuses both before and after a forced refresh. The vault asking
-for consent is the consent detour at sign-in and `invalid_grant` at
-refresh. Google or the vault failing is `server_error`, and at refresh
-gives the refresh token back, so a retry may work: no answer, any HTTP
-error from the vault, a tokeninfo answer other than 200 or 400, the vault
+for consent (on a plain retrieve, after a token was waited out, or after
+forcing a token Google refused, checked once more) is the consent detour
+at sign-in and `invalid_grant` at refresh, except consent to renew the
+token a refresh just waited out, which is `server_error` once (Vault
+renewal). Google or the vault failing is `server_error`, and at refresh
+gives the refresh token back (or, failing before the rotation, never
+took it), so a retry may work: no
+answer, any HTTP error from the vault, a tokeninfo answer other than 200
+or a 400 `invalid_token` (an egress proxy's 400 included), the vault
 answering `pending` (its API reference: "the caller should retry ... after
-some time") or nothing usable, and a forced refresh that returns the same
-token or another nearly spent one (each unless the token it was to replace
-is still usable, above). A vault error message that quotes a forced token
-back has it replaced before it is logged.
+some time") or nothing usable, a forced refresh that returns the same
+token, and a token too close to expiry to use (above). A vault error
+message that quotes a forced token back has it replaced before it is
+logged.
 
 **Tokens.** All sealed, the issuer bound into every purpose:
 
@@ -659,11 +833,14 @@ audience is checked against the configured resource; more than one
 `resource` parameter is refused; an authorization code is given back if
 sealing the tokens fails; custody failures that are Google failing are
 `server_error`, not `access_denied`, including a `pending` or empty vault
-answer (a sign-out before); the vault declining to force-refresh a
-still-valid token leaves that token in use (with 3 minutes left) or is
-`server_error`, rather than signing the person out; a vault token
-tokeninfo refuses is force-refreshed once, then a consent detour at
-sign-in or a refusal, rather than `server_error`; client-resolution
+answer (a sign-out before); a vault token Google still accepts is never
+force-refreshed (kode-gopher forces one with under 5 minutes left): it is
+used down to 75 seconds at refresh (90 at sign-in), and one
+with less is waited out and retrieved again, before the refresh token's
+family is rotated (Vault renewal, above); a
+vault token tokeninfo refuses is force-refreshed once, then a consent
+detour at sign-in or a refusal, rather than `server_error`;
+client-resolution
 errors (CIMD contents, dial errors) are not echoed; error descriptions
 keep to RFC 6749's character set; the SSRF filter also refuses NAT64, 6to4, Teredo
 and other special-purpose ranges; flow cookies are `__Host-` where
@@ -690,7 +867,9 @@ instead of a damaged-link page. kode-gopher's known limitation holds here
 too: the vault's consent leg parks the flow in one `steward_consent`
 cookie, so two sign-ins that both reach the vault's own consent screen
 still collide (the later one replaces the earlier one's); finish one
-first.
+first. `2f33327` (kode-gopher#56), in part: a tokeninfo 400 is Google
+refusing only with `error` `invalid_token` in its body; any other 400 (an
+egress proxy's) is `server_error`.
 
 ### Both paths on one resource (`httpauth`, `mcpauth`)
 

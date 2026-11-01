@@ -22,6 +22,7 @@ import (
 	"net/http"
 	"slices"
 	"strings"
+	"time"
 
 	"golang.org/x/oauth2"
 )
@@ -69,7 +70,7 @@ func (s *Server) clientCredentials(r *http.Request, c *client) (map[string]any, 
 		}
 		p.Token, p.TokenExp, p.Email = tok.AccessToken, tok.Expiry.Unix(), sa
 		if tok.Expiry.IsZero() {
-			p.TokenExp = s.now().Add(AccessTTL + 2*minGoogleTokenLife).Unix()
+			p.TokenExp = s.now().Add(AccessTTL + 10*time.Minute).Unix()
 		}
 	}
 	now := s.now()
