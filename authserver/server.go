@@ -173,7 +173,9 @@ type Config struct {
 	// Replay remembers spent authorization codes and rotated refresh
 	// tokens. Nil means an in-memory cache, which is per replica: with
 	// several replicas, a code or a rotated refresh token could be used
-	// once on each. Supply a shared one to close that.
+	// once on each. Supply a shared one to close that, implementing
+	// RotationIDReplayCache too, or a refresh can give back a concurrent
+	// refresh's rotation (see ReplayCache.Unrotate).
 	Replay ReplayCache
 
 	// RefreshReuseGrace tolerates a refresh token presented again just
@@ -184,8 +186,9 @@ type Config struct {
 	// refresh issued stays valid and the client can re-read it from its
 	// store. Any older generation, or the same one later, still revokes
 	// the family, and nothing is ever issued for a rotated token. Only a
-	// Replay that implements GraceReplayCache (the in-memory one does) can
-	// tell the difference; with any other, every reuse revokes. Zero, the
+	// Replay that implements GraceReplayCache or RotationIDReplayCache (the
+	// in-memory one implements both) can tell the difference; with any
+	// other, every reuse revokes. Zero, the
 	// default, means no grace: every reuse revokes. A grace weakens theft
 	// detection, so set one only for clients that need it; 10 seconds
 	// covers a concurrent refresh's round trip (admission, a Google or

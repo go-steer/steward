@@ -493,6 +493,60 @@ transient failure runs detached from the request's context, so a client
 that went away mid-refresh can retry; a `Rotate` error is followed by a
 conditional `Unrotate` in case it was applied.
 
+**Rotation IDs.** A refresh rotates its family first and gives the
+rotation back if it then fails for a transient reason (the directory,
+Google or the vault unavailable, sealing failing), so the client's retry
+is not taken for a replay. `Unrotate` is conditional only on the
+generation, which a shared cache makes unsafe: when replica A's `Rotate`
+fails without applying (or times out, outcome unknown) while replica B's
+refresh with the same token applies, A's `Unrotate` gives back B's
+rotation, and A's client's retry rotates the family again. A rotated token
+has yielded tokens and two refresh tokens of the next generation are
+live: a second branch of the family, so whichever holder refreshes second
+is never caught presenting a rotated token. A cache closes that by also
+implementing `RotationIDReplayCache` (additive beside `ReplayCache`, like
+`GraceReplayCache`; `MemoryReplayCache` implements it). The server then
+rotates with `RotateWithID`, carrying a fresh random ID per refresh (and
+the grace, if one is set), and gives back with `UnrotateWithID` and that
+ID, which does nothing unless the family is at the next generation by
+that very rotation.
+
+- *An unknown outcome.* After a `RotateWithID` error the server still
+  gives the rotation back and answers `server_error`: if the rotation
+  applied, it is undone and the retry works; if it did not and another
+  refresh rotated the family, that rotation stands and the retry is a
+  replay (refused, and revoking outside a grace), which is the truth: the
+  token was spent. A write that lands after the give-back meant to undo it
+  either rotates the family with no token issued for it or, if another
+  refresh rotated it meanwhile, is a replay (revoking, or refused in a
+  grace); either way the retry is refused and the user signs in again: a
+  sign-out, never a second branch. The same call delivered twice (a cache
+  client retrying after a lost reply) is not a replay: `RotateWithID` is
+  idempotent for its own ID, reporting the rotation applied and changing
+  nothing, and a duplicated `UnrotateWithID` finds nothing to give back.
+- *State.* One more value per family, the ID of the rotation that moved
+  it to its current generation, set atomically with the generation by
+  every rotation (`Rotate` and `RotateGrace` set none, which no ID
+  matches), so a replaced rotation's ID never matches again. A refusal
+  leaves it; a give-back clears it, since the rotation it named no longer
+  exists. The in-memory cache keeps one 26-character ID per family, so
+  storage still grows with families, not refreshes.
+- *Rolling upgrades.* The fix holds once every server sharing the cache
+  calls the ID methods: a replica still running older code calls
+  `Unrotate` after a `Rotate` error, which can give back a newer
+  replica's rotation.
+- *Caches without it.* A shared cache that does not implement the
+  interface keeps today's behaviour: `Rotate` or `RotateGrace`, then the
+  generation-only `Unrotate`, including after a `Rotate` error. That is
+  racy under sharing as above; it is kept rather than skipping the
+  give-back after an error, because the `ReplayCache` contract promised
+  it and a timeout after a write would otherwise sign the person out. The
+  race needs a give-back after a `Rotate` error, or an `Unrotate`
+  delivered twice: after a rotation that did apply, no other request can
+  have moved the family on, since the token that would do it has not been
+  issued (unless an earlier racy give-back already let a second rotation
+  in).
+
 **Reuse grace.** MCP clients whose processes share one token store (for
 example two Claude Code processes, or one client refreshing from several
 goroutines through a token source that does not serialize them) present
@@ -516,17 +570,16 @@ family survived. The log tells them apart.
   flight or not, is refused at the same step. If the winner then fails for
   a transient reason, its `Unrotate` moves the family back and forgets the
   grace, so the shared token works again for both, and the generation
-  before it is a replay again. (`Unrotate` is conditional on the
-  generation, not on which request rotated: with a shared cache, a
-  `Rotate` that failed without applying can undo a concurrent winner's
-  rotation, so a retry mints a second branch. That predates the grace;
-  what changes is that the dead branch's token, presented inside the
-  window, is refused without revoking.)
+  before it is a replay again. A loser's give-back after a failed
+  `Rotate` cannot undo the winner's rotation (rotation IDs, above), so it
+  cannot make the loser's token live again either; with a cache without
+  rotation IDs it can, as it could before the grace.
 - *State.* One more time per family, the grace deadline of its last
   rotation, kept and checked with the generation. A cache supplies it by
   implementing `GraceReplayCache` (`RotateGrace`, additive beside
-  `ReplayCache`, so existing shared caches still compile); one that does
-  not gets no grace and revokes on every reuse, as before. Replicas sharing
+  `ReplayCache`, so existing shared caches still compile) or
+  `RotationIDReplayCache`, whose `RotateWithID` carries it; one that does
+  neither gets no grace and revokes on every reuse, as before. Replicas sharing
   a cache share the grace. With a per-replica `MemoryReplayCache`, the
   second presentation on another replica is the per-replica weakness above
   (a fresh rotation there), with or without a grace. The deadline is an
@@ -596,8 +649,9 @@ dedicated source would be a purser addition.
 resource, Google scopes, optional workload service account, `Admitter`,
 pluggable replay cache and keys, slog), most from this port's adversarial
 review and worth porting back: refresh-token families with reuse
-detection instead of one replay entry per refresh, and the reuse grace
-that spares a concurrent refresh's family; refresh re-checks the
+detection instead of one replay entry per refresh, the reuse grace
+that spares a concurrent refresh's family, and rotation IDs so a refresh
+gives back only its own rotation; refresh re-checks the
 grant's scopes against the configuration; a narrowing refresh does not
 narrow the grant; rotating a workload's secret revokes its tokens; an
 email change since sign-in forces a new sign-in; the refresh token's

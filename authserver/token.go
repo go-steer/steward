@@ -303,14 +303,16 @@ func (s *Server) refreshTokens(ctx context.Context, r *http.Request, c *client) 
 	// One expiry for the family and the token that will carry it, so the
 	// family is never forgotten before its newest token expires.
 	exp := s.now().Add(RefreshTTL)
-	release := func() {
-		s.undo(ctx, "give back a refresh rotation", func(ctx context.Context) error { return s.used.Unrotate(ctx, p.Family, p.Gen) })
-	}
-	rotated, err := s.rotate(ctx, p.Family, p.Gen, exp)
+	rotated, unrotate, err := s.rotate(ctx, p.Family, p.Gen, exp)
+	release := func() { s.undo(ctx, "give back a refresh rotation", unrotate) }
 	if err != nil {
 		s.log.ErrorContext(ctx, "authserver: replay cache", "err", err)
-		// The rotation may have been applied before the error (a
-		// timeout after a write): Unrotate is conditional, so undo it.
+		// The outcome is unknown: the rotation may have been applied
+		// before the error (a timeout after a write), so give it back.
+		// With a RotationIDReplayCache that gives back this request's
+		// rotation only, never a concurrent refresh's, and the client's
+		// retry is a replay if there was one. With any other cache it is
+		// conditional only on the generation (see ReplayCache.Unrotate).
 		release()
 		return nil, serverError("couldn't record the refresh token's use")
 	}
@@ -357,16 +359,30 @@ func (s *Server) refreshTokens(ctx context.Context, r *http.Request, c *client) 
 }
 
 // rotate moves family on from gen through the replay cache, with the
-// reuse grace if the cache supports one.
-func (s *Server) rotate(ctx context.Context, family string, gen uint64, exp time.Time) (RotateResult, error) {
+// reuse grace if the cache supports one, and returns how to give the
+// rotation back. With a RotationIDReplayCache the rotation carries a fresh
+// ID, and giving it back names that ID, so it cannot give back a
+// concurrent refresh's rotation.
+func (s *Server) rotate(ctx context.Context, family string, gen uint64, exp time.Time) (RotateResult, func(context.Context) error, error) {
+	var graceUntil time.Time
+	if s.grace > 0 {
+		graceUntil = s.now().Add(s.grace)
+	}
+	if c, ok := s.used.(RotationIDReplayCache); ok {
+		id := rand.Text()
+		r, err := c.RotateWithID(ctx, family, gen, exp, graceUntil, id)
+		return r, func(ctx context.Context) error { return c.UnrotateWithID(ctx, family, gen, id) }, err
+	}
+	unrotate := func(ctx context.Context) error { return s.used.Unrotate(ctx, family, gen) }
 	if g, ok := s.used.(GraceReplayCache); ok && s.grace > 0 {
-		return g.RotateGrace(ctx, family, gen, exp, s.now().Add(s.grace))
+		r, err := g.RotateGrace(ctx, family, gen, exp, graceUntil)
+		return r, unrotate, err
 	}
 	fresh, err := s.used.Rotate(ctx, family, gen, exp)
 	if fresh {
-		return RotateApplied, err
+		return RotateApplied, unrotate, err
 	}
-	return RotateRevoked, err
+	return RotateRevoked, unrotate, err
 }
 
 // narrowScope checks that every requested scope was in the original grant.
