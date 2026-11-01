@@ -583,17 +583,23 @@ What this ordering means:
   write timeout does not cancel the request, so a refresh that waited and
   then rotated would have lost its answer, and the retry would be a
   replay. Over HTTP/2 it resets the stream, which cancels the request:
-  every waiting refresh and sign-in would fail, nothing rotated.
-  Before waiting, custody moves the response's write deadline
+  every waiting refresh and sign-in would fail, nothing rotated. Each
+  endpoint records the server's deadline before any other work, and
+  before waiting, custody moves the response's write deadline
   past the wait plus 30 seconds (`http.ResponseController`), on the token
   endpoint, the sign-in callback and the consent return, and the token
   endpoint moves it 30 seconds past the rotation again, so slow vault
   calls after the wait cannot use it up (with a `WriteTimeout` under 30
   seconds, every refresh, waited or not, gets those 30 seconds). It only ever moves the server's
-  own deadline (`WriteTimeout` from the request's start) later: without a
-  `WriteTimeout` it sets none, and it never shortens a longer one. A
-  `ResponseWriter` wrapped by middleware without `Unwrap` cannot be
-  extended; there, keep `WriteTimeout` above 2 minutes.
+  own deadline (`WriteTimeout`, counted from when the handler starts)
+  later: without a `WriteTimeout` it sets none, and it never shortens a
+  longer one. The server starts its own count a little earlier (once the
+  request's headers are read over HTTP/1.1, when the stream opens over
+  HTTP/2), so time spent in middleware in front of these endpoints goes
+  unseen: a wait whose end plus 30 seconds crosses the real deadline by
+  less than that time is not extended. A `ResponseWriter` wrapped by middleware without `Unwrap` cannot be
+  extended; there, or with slow middleware, keep `WriteTimeout` above 2
+  minutes.
 - **`http.Server.ReadTimeout` shorter than the wait** does not cancel it,
   in the Go this module requires (1.26.10): once the request body is read
   (sign-in requests have none; the token endpoint reads its form before

@@ -28,8 +28,11 @@ import (
 	"strconv"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
+
+	"github.com/go-steer/steward/seal"
 )
 
 // scriptedVault answers retrieve and finalize from a script, one answer
@@ -950,6 +953,143 @@ func TestVaultSignInWaitOutlastsWriteTimeout(t *testing.T) {
 			}
 			if r := e.token(exchangeForm(id, loc.Query().Get("code"), v), "", ""); r.status != http.StatusOK || r.Expires < int64((AccessTTL-time.Minute).Seconds()) {
 				t.Errorf("exchange %+v, want a fresh Google token's access token", r)
+			}
+		})
+	}
+}
+
+// slowKeys is a KeyProvider whose first keyring in a request marked with
+// slowKeyring takes delay to come, as a seal.Reloader's first load from
+// Secret Manager does.
+type slowKeys struct {
+	seal.KeyProvider
+	delay time.Duration
+}
+
+// slowKeyring marks a request whose first keyring is slow. Its value is
+// an *atomic.Bool, set once that keyring is asked for.
+type slowKeyring struct{}
+
+func (k slowKeys) Keyring(ctx context.Context) (*seal.Keyring, error) {
+	if asked, ok := ctx.Value(slowKeyring{}).(*atomic.Bool); ok && asked.CompareAndSwap(false, true) {
+		select {
+		case <-time.After(k.delay):
+		case <-ctx.Done():
+			return nil, ctx.Err()
+		}
+	}
+	return k.KeyProvider.Keyring(ctx)
+}
+
+// deadlineRecorder records the write deadlines set on a response and
+// passes them on.
+type deadlineRecorder struct {
+	http.ResponseWriter
+	record func(time.Time)
+}
+
+func (d deadlineRecorder) SetWriteDeadline(t time.Time) error {
+	d.record(t)
+	return http.NewResponseController(d.ResponseWriter).SetWriteDeadline(t)
+}
+
+func (d deadlineRecorder) Unwrap() http.ResponseWriter { return d.ResponseWriter }
+
+// Each endpoint that may wait records the server's WriteTimeout deadline
+// before any other work, so slow work ahead of the wait (here the
+// request's first keyring, which opens the sign-in state, the parked
+// consent or the refresh token) cannot make that deadline look later
+// than it is. Recorded late, it looks further off, and a wait plus
+// postWaitBudget that does cross it is not extended. The WriteTimeout
+// falls between the two: past the wait plus postWaitBudget counted from
+// a record after the slow keyring, short of it counted from the
+// request's start. No time passes in the wait itself.
+func TestVaultWriteDeadlineRecordedFirst(t *testing.T) {
+	t.Parallel()
+	const (
+		life  = 1 // the vault token's seconds left: the wait is life+expirySkew
+		delay = 2 * time.Second
+		// From the request's start, the wait ends after delay+life+expirySkew
+		// (6 s) and its answer is due postWaitBudget later, past this.
+		writeTimeout = life*time.Second + expirySkew + postWaitBudget + delay/2
+	)
+	for _, path := range []string{PathCallback, PathConsentContinue, PathToken} {
+		t.Run(strings.TrimPrefix(path, "/"), func(t *testing.T) {
+			t.Parallel()
+			var (
+				armed   atomic.Bool
+				mu      sync.Mutex
+				start   time.Time   // the request reached the handler
+				set     []time.Time // write deadlines it set
+				waitEnd time.Time   // when its wait would end
+			)
+			e := newTestEnvServer(t, false, func(c *Config) { c.Keys = slowKeys{c.Keys, delay} }, func(s *http.Server) {
+				s.WriteTimeout = writeTimeout
+				next := s.Handler
+				s.Handler = http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+					if !armed.Load() || r.URL.Path != path {
+						next.ServeHTTP(w, r)
+						return
+					}
+					mu.Lock()
+					start, set = time.Now(), nil
+					mu.Unlock()
+					rec := deadlineRecorder{w, func(t time.Time) {
+						mu.Lock()
+						set = append(set, t)
+						mu.Unlock()
+					}}
+					next.ServeHTTP(rec, r.WithContext(context.WithValue(r.Context(), slowKeyring{}, new(atomic.Bool))))
+				})
+			})
+			e.google.mu.Lock()
+			last := e.google.mint(alice, ScopeOpenID+" "+ScopeEmail+" "+ScopeCloudPlatform, life)
+			e.google.mu.Unlock()
+			var id string
+			var first tokenResp
+			if path == PathConsentContinue {
+				overrideVault(e, "-", `{"success":{"token":"`+last+`"}}`)
+			} else {
+				id, first = e.signIn(newBrowser(t)) // the vault holds alice's grant
+				overrideVault(e, `{"success":{"token":"`+last+`"}}`)
+			}
+			e.as.cfg.Custody.(*VaultCustody).sleeper = &sleeper{func(ctx context.Context, d time.Duration) error {
+				mu.Lock()
+				waitEnd = time.Now().Add(d)
+				mu.Unlock()
+				return e.vault.sleep(ctx, d)
+			}}
+			armed.Store(true)
+			if path == PathToken {
+				if r := e.token(refreshForm(id, first.Refresh), "", ""); r.status != http.StatusOK {
+					t.Fatalf("refresh: %+v", r)
+				}
+			} else {
+				cid, v := e.register(), rand.Text()+rand.Text()
+				if loc, page := newBrowser(t).visit(e.authorizeURL(cid, v, nil)); loc == nil || loc.Query().Get("code") == "" {
+					t.Fatalf("sign-in: %v %q, want a code", loc, page)
+				}
+			}
+			mu.Lock()
+			defer mu.Unlock()
+			if start.IsZero() || waitEnd.IsZero() {
+				t.Fatalf("no wait at %s (request started %v, wait ends %v)", path, start, waitEnd)
+			}
+			// The latest deadline set. (At /token the extension before the
+			// rotation can come after the wait's and be earlier, because no
+			// time passes in this wait; a real wait puts it later.)
+			deadline := start.Add(writeTimeout)
+			for _, d := range set {
+				if d.After(deadline) {
+					deadline = d
+				}
+			}
+			// The extension is made just before the wait starts, a moment
+			// before waitEnd is taken; the margin either way is about a
+			// second.
+			if want := waitEnd.Add(postWaitBudget - 300*time.Millisecond); deadline.Before(want) {
+				t.Errorf("the answer is due %v after the request started, %v short of postWaitBudget after the wait (%d deadlines set)",
+					deadline.Sub(start).Round(time.Millisecond), want.Sub(deadline).Round(time.Millisecond), len(set))
 			}
 		})
 	}
