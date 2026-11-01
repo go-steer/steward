@@ -217,6 +217,11 @@ func (s *Server) toGoogle(w http.ResponseWriter, r *http.Request, req *authReque
 
 // handleCallback is Google's redirect after sign-in.
 func (s *Server) handleCallback(w http.ResponseWriter, r *http.Request) {
+	// Recorded first, as near the server's WriteTimeout deadline as the
+	// handler gets: custody may wait out a nearly spent token, and that
+	// wait extends the deadline (withResponse). Opening the state may be
+	// slow (a keyring's first load).
+	ctx := withResponse(r.Context(), w)
 	q := r.URL.Query()
 	var b browserBound
 	if _, ok := s.openBound(w, r, stepCallback, purposeState, q.Get("state"), &b); !ok {
@@ -233,7 +238,6 @@ func (s *Server) handleCallback(w http.ResponseWriter, r *http.Request) {
 		fail("access_denied", "Google sign-in was cancelled or refused")
 		return
 	}
-	ctx := withResponse(r.Context(), w) // custody may wait out a nearly spent token
 	t, err := s.cfg.Google.exchange(ctx, s.google.hc, q.Get("code"), s.CallbackURL(), b.Verifier)
 	if err != nil {
 		s.log.WarnContext(ctx, "authserver: Google code exchange failed", "err", err)
@@ -299,6 +303,8 @@ func (s *Server) toConsent(w http.ResponseWriter, r *http.Request, req *authRequ
 
 // handleConsentContinue is where the vault's consent leg returns.
 func (s *Server) handleConsentContinue(w http.ResponseWriter, r *http.Request) {
+	// Recorded first, as in handleCallback: custody may wait.
+	ctx := withResponse(r.Context(), w)
 	var p pendingConsent
 	stop := stopNoCookie
 	if ck, err := r.Cookie(s.cookieName(cookieConsent)); err == nil {
@@ -309,9 +315,9 @@ func (s *Server) handleConsentContinue(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	s.clearCookie(w, cookieConsent)
-	g, err := s.cfg.Custody.finish(withResponse(r.Context(), w), s.google, p.User, p.Consent, r.URL.Query(), s.ContinueURL())
+	g, err := s.cfg.Custody.finish(ctx, s.google, p.User, p.Consent, r.URL.Query(), s.ContinueURL())
 	if err != nil {
-		s.log.WarnContext(r.Context(), "authserver: custody failed at consent", "custody", s.cfg.Custody.Name(), "email", p.User.Email, "err", err)
+		s.log.WarnContext(ctx, "authserver: custody failed at consent", "custody", s.cfg.Custody.Name(), "email", p.User.Email, "err", err)
 		s.redirectError(w, r, p.Req.RedirectURI, p.Req.State, &authError{custodyError(err), grantFailed})
 		return
 	}

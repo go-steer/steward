@@ -166,7 +166,10 @@ exported API" in [`CONTRIBUTING.md`](./CONTRIBUTING.md)).
   processes or a restart during the wait never finds the family rotated;
   the wait also moves the server's `WriteTimeout` deadline past itself
   (never setting one where there is none, never shortening one), so a
-  shorter `http.Server.WriteTimeout` does not lose the answer. Give the
+  shorter `http.Server.WriteTimeout` does not lose the answer; the token
+  endpoint, the sign-in callback and the consent return note that
+  deadline before any other work, so a slow keyring cannot make it look
+  later than it is. Give the
   front end at least 2 minutes on the token endpoint, the sign-in
   callback and the consent return; a shorter timeout turns that request
   into a retry. Reuse detection now runs after the vault work, so while
