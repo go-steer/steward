@@ -29,6 +29,8 @@ import (
 	"strings"
 	"testing"
 	"unicode/utf8"
+
+	"github.com/go-steer/steward/seal"
 )
 
 // spoofName carries a right-to-left override, an isolate pair, zero-width
@@ -94,6 +96,22 @@ func TestConsentCIMDNameCannotSpoofClientID(t *testing.T) {
 			t.Errorf("the client's name element holds its client ID: %q", m[1])
 		}
 	}
+	// Resolution cleans it too, not only the page, which keeps it clean in
+	// the log (kode-gopher#55 found this site untested in both repos).
+	if c, err := e.as.resolveClient(context.Background(), docURL); err != nil {
+		t.Error(err)
+	} else if c.Name != spoofClean {
+		t.Errorf("resolved CIMD client: name %q, want %q", c.Name, spoofClean)
+	}
+}
+
+// The page cleans the name itself, whatever reaches it (kode-gopher#55).
+func TestConsentPageCleansName(t *testing.T) {
+	t.Parallel()
+	e := newTestEnv(t, false, nil)
+	w := httptest.NewRecorder()
+	e.as.consentPage(w, &client{ID: seal.Prefix + "x", Name: spoofName}, clientRedirect, "form")
+	checkConsentName(t, w.Body.String())
 }
 
 func TestConsentDCRNameCannotSpoofRedirect(t *testing.T) {

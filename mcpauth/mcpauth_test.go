@@ -54,11 +54,12 @@ func fakeGoogle(t *testing.T) string {
 		}
 		p, ok := people[tok]
 		if !ok {
-			code := http.StatusBadRequest // tokeninfo: invalid_token
+			// Google's refusals: tokeninfo 400 invalid_token, userinfo 401.
+			code, body := http.StatusBadRequest, `{"error":"invalid_token","error_description":"Invalid Value"}`
 			if r.URL.Path == "/userinfo" {
-				code = http.StatusUnauthorized
+				code, body = http.StatusUnauthorized, `{"error":"invalid_request","error_description":"Invalid Credentials"}`
 			}
-			http.Error(w, "{}", code)
+			http.Error(w, body, code)
 			return
 		}
 		if r.URL.Path == "/userinfo" {
