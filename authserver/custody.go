@@ -59,12 +59,13 @@ const exchangeAllowance = 15 * time.Second
 const minSignInTokenLife = minRefreshTokenLife + exchangeAllowance
 
 // maxExpiryWait is the longest a token too close to expiry to use is
-// waited out. It covers minRefreshTokenLife, so a refresh does not fail
-// just because the token is nearly spent: an active client's refresh lands
-// when the Google token has a minute left (its access token stopped
-// then), and waiting that minute is the only way to a fresh token that
-// does not need the person. (It still fails if the vault's next token is
-// short too.)
+// waited out, or need if that is longer (at sign-in, minSignInTokenLife:
+// 93 seconds with expirySkew). It covers minRefreshTokenLife, so a
+// refresh does not fail just because the token is nearly spent: an active
+// client's refresh lands when the Google token has a minute left (its
+// access token stopped then), and waiting that minute is the only way to
+// a fresh token that does not need the person. (It still fails if the
+// vault's next token is short too.)
 const maxExpiryWait = minRefreshTokenLife
 
 // expirySkew is how long past tokeninfo's expiry a waited-out token is
@@ -215,12 +216,14 @@ func (SealedCustody) refresh(ctx context.Context, g *upstream, u User, secret, _
 // spelling, which the vault matches exactly. The vault's expireTime is
 // ignored in favour of tokeninfo's. A token tokeninfo refuses is
 // force-refreshed once; one Google still accepts never is, and one too
-// close to expiry to use is waited out (up to 78 seconds, plus the vault
-// and tokeninfo calls, during the token request or the sign-in callback)
-// and retrieved again. At refresh the wait runs before the refresh
-// token's family is rotated (prepare), so it never holds the family
-// rotated, and it extends the response's write deadline past itself. A
-// front end with a shorter timeout turns that request into a retry.
+// close to expiry to use is waited out (up to 78 seconds at refresh and
+// 93 at sign-in, plus the vault and tokeninfo calls, during the token
+// request, the sign-in callback or the consent return) and retrieved
+// again. At refresh the wait runs before the refresh token's family is
+// rotated (prepare), so it never holds the family rotated. It moves the
+// server's WriteTimeout deadline past itself, unless the ResponseWriter
+// is wrapped without Unwrap. Give the front end a timeout of at least 2
+// minutes on those paths; a shorter one turns that request into a retry.
 type VaultCustody struct {
 	// AuthProvider is the full resource name,
 	// projects/<p>/locations/<l>/authProviders/<name>. Required.
@@ -353,13 +356,14 @@ func (v *VaultCustody) refresh(ctx context.Context, g *upstream, u User, _, cont
 // token was expired or invalid". A forced refresh "fetches a new token or
 // initiates a new consent flow", so a consent request then is the grant
 // gone: it is returned, for a sign-in to detour through and a refresh to
-// refuse.
+// refuse, once a plain retrieve has not brought another valid token (some
+// other caller may have forced the same expired token first).
 //
 // A token Google still accepts is never forced: asked to, the vault asked
 // for consent instead (kode-gopher's vault spike, docs/design-in-cluster.md).
 // One with need left is used, and the access token stops a minute before
 // it (sealAccess). One with less is waited out if it expires within
-// maxExpiryWait, and the vault asked again: after a real expiry a plain
+// need, or maxExpiryWait if longer, and the vault asked again: after a real expiry a plain
 // retrieve brought a fresh token in the spike, and if the vault hands back
 // the expired one, Google refuses it and it is forced. Consent then
 // (errWaitedConsent) is not yet read as the grant gone: the vault may lag
@@ -367,14 +371,39 @@ func (v *VaultCustody) refresh(ctx context.Context, g *upstream, u User, _, cont
 // server_error, and the next request, which does not wait, forces the
 // token again and reads consent as the grant gone; a sign-in, the person
 // being in the browser, detours through consent as for any other. A short
-// token waited out once, one a forced refresh brought, or one with longer
-// than maxExpiryWait left is server_error.
+// token waited out once, or one a forced refresh brought, is server_error.
 func (v *VaultCustody) grant(ctx context.Context, g *upstream, u User, r *vaultRetrieveResponse, continueURI string, need time.Duration) (*grant, *consent, error) {
 	var (
-		forced string // the token whose refresh was forced, if any
-		waited string // the token too short to use that was waited out
+		forced    string // the token whose refresh was forced, if any
+		waited    string // the token too short to use that was waited out
+		rechecked bool   // consent to a forced refresh was checked again
 	)
 	for {
+		if r.URIConsentRequired != nil && forced != "" && !rechecked {
+			// Before consent to a forced refresh is a verdict, ask once
+			// more, plainly: another caller (another client of the same
+			// person, forcing the same expired token) may just have
+			// renewed it, and the vault then refuses a stale force. A token
+			// other than the forced one that Google accepts, with need
+			// left, goes on to the full checks (account, scopes, email);
+			// anything else leaves the verdict as it was. Failing to ask is
+			// failing.
+			rechecked = true
+			again, err := v.retrieve(ctx, g, u.Sub, continueURI, "")
+			if err != nil {
+				return nil, nil, err
+			}
+			if again.Success != nil && again.Success.Token != "" && again.Success.Token != forced {
+				ti, err := g.client.tokenInfo(ctx, g.hc, again.Success.Token)
+				if err != nil && !errors.Is(err, errGoogleToken) {
+					return nil, nil, err
+				}
+				if err == nil && time.Until(ti.Expiry) >= need {
+					r = again
+					continue
+				}
+			}
+		}
 		switch {
 		case r.URIConsentRequired != nil && forced != "" && forced == waited:
 			return nil, consentOf(r), errWaitedConsent
@@ -421,7 +450,7 @@ func (v *VaultCustody) grant(ctx context.Context, g *upstream, u User, r *vaultR
 		if left >= need {
 			return &grant{AccessToken: tok, Expiry: ti.Expiry, Scopes: ti.Scopes}, nil, nil
 		}
-		if waited != "" || forced != "" || left > maxExpiryWait {
+		if waited != "" || forced != "" || left > max(need, maxExpiryWait) {
 			// A fresh token is due only once this one expires, and
 			// forcing it would ask for consent.
 			return nil, nil, fmt.Errorf("vault: the Google token has %ds left, too little to use, and the vault renews it only once it expires; try again", int(left.Seconds()))
@@ -460,23 +489,40 @@ func (v *VaultCustody) wait(ctx context.Context, d time.Duration) error {
 	}
 }
 
-// responseKey carries the response writer whose write deadline a long
-// custody wait extends.
+// responseKey carries the response whose write deadline a long custody
+// wait extends.
 type responseKey struct{}
 
-// withResponse lets custody work under ctx extend w's write deadline.
-func withResponse(ctx context.Context, w http.ResponseWriter) context.Context {
-	return context.WithValue(ctx, responseKey{}, w)
+type responseDeadline struct {
+	w     http.ResponseWriter
+	limit time.Time // the server's own deadline (WriteTimeout from the start); zero if none
 }
 
-// extendWriteDeadline sets the write deadline of the response in ctx, if
-// any, d from now. http.Server.WriteTimeout is a deadline set when the
-// request is read, and over HTTP/1.1 it does not cancel the request: the
-// handler runs on and its answer is lost. A writer that does not support
-// it (a wrapper without Unwrap) is left as it is.
+// withResponse lets work under ctx extend w's write deadline. It records
+// the deadline the server set from its WriteTimeout, so an extension
+// never shortens it, and none is set where the server has none.
+func withResponse(ctx context.Context, w http.ResponseWriter) context.Context {
+	rd := responseDeadline{w: w}
+	if srv, ok := ctx.Value(http.ServerContextKey).(*http.Server); ok && srv.WriteTimeout > 0 {
+		rd.limit = time.Now().Add(srv.WriteTimeout)
+	}
+	return context.WithValue(ctx, responseKey{}, rd)
+}
+
+// extendWriteDeadline moves the write deadline of the response in ctx, if
+// any, to at least d from now. http.Server.WriteTimeout is a deadline set
+// when the request is read, and over HTTP/1.1 it does not cancel the
+// request: the handler runs on and its answer is lost, which after a
+// refresh token's family was rotated makes the client's retry a replay.
+// Without a WriteTimeout there is no deadline to move. A writer that does
+// not support it (a wrapper without Unwrap) is left as it is.
 func extendWriteDeadline(ctx context.Context, d time.Duration) {
-	if w, ok := ctx.Value(responseKey{}).(http.ResponseWriter); ok {
-		_ = http.NewResponseController(w).SetWriteDeadline(time.Now().Add(d))
+	rd, ok := ctx.Value(responseKey{}).(responseDeadline)
+	if !ok || rd.limit.IsZero() {
+		return
+	}
+	if t := time.Now().Add(d); t.After(rd.limit) {
+		_ = http.NewResponseController(rd.w).SetWriteDeadline(t)
 	}
 }
 

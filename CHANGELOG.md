@@ -150,23 +150,29 @@ exported API" in [`CONTRIBUTING.md`](./CONTRIBUTING.md)).
   still accepts is now never force-refreshed. It is used while it has 75
   seconds left at refresh, or 90 at sign-in (the code is exchanged a
   moment later), and the access token stops a minute before it, as
-  before. One with less is waited out (at most 78 seconds plus the vault
-  and tokeninfo calls, cancelled with the request) and the vault asked
-  again, which renews an expired token; the expired token handed back is
-  force-refreshed (at refresh, consent then is `server_error` this once,
-  in case the vault lags Google by a few seconds; the next refresh reads
-  it as the grant gone). An active client refreshes when its Google
+  before. One with less is waited out (at most 78 seconds at refresh and
+  93 at sign-in, plus the vault and tokeninfo calls, cancelled with the
+  request) and the vault asked again, which renews an expired token; the expired token handed back is
+  force-refreshed. Consent to a forced refresh is checked once more with a
+  plain retrieve (another client may just have renewed the token), and at
+  refresh, consent to renew the token that request waited out is
+  `server_error` this once, in case the vault lags Google by a few
+  seconds; the next refresh reads it as the grant gone. An active client refreshes when its Google
   token has a minute left, so this refresh used to be `server_error`,
   which the MCP TypeScript SDK answers with a new browser sign-in, every
   hour; it now takes up to about a minute instead. At refresh the wait,
   and all the vault work, runs before the refresh token's family is
   rotated, so a client giving up, a concurrent refresh from another of its
   processes or a restart during the wait never finds the family rotated;
-  the wait also moves the response's write deadline past itself, so a
-  shorter `http.Server.WriteTimeout` does not lose the answer. A front end
-  with a shorter timeout than the wait turns that refresh into a retry. A
-  token too short to use and not waited out is `server_error`, never a
-  sign-out.
+  the wait also moves the server's `WriteTimeout` deadline past itself
+  (never setting one where there is none, never shortening one), so a
+  shorter `http.Server.WriteTimeout` does not lose the answer. Give the
+  front end at least 2 minutes on the token endpoint, the sign-in
+  callback and the consent return; a shorter timeout turns that request
+  into a retry. Reuse detection now runs after the vault work, so while
+  the vault or Google fails a replayed token gets `server_error` rather
+  than revoking its family (`docs/DESIGN.md`). A token too short to use
+  and not waited out is `server_error`, never a sign-out.
 - **`authserver`: a vault token Google's tokeninfo refuses is a refusal.**
   A 400 `invalid_token` from tokeninfo was `server_error`. The token is now
   force-refreshed once (it may have expired before the vault's

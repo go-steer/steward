@@ -474,22 +474,33 @@ second or two; one that waits longer (`CodeTTL` allows a minute) may get
 redirect had the token been held back. Its access token stops a minute
 before it, as always.
 
-A token with less than `need` left can only be renewed by expiring. If it
-expires within 75 seconds, steward waits it out (its remaining life plus 3
-seconds, cancelled with the request) and asks the vault again, plainly: a
-fresh token is used; the expired token handed back is refused by tokeninfo
-and forced, which the reference allows. If that forced refresh asks for
-consent, a refresh gets `server_error`, not yet a sign-out, in case the
-vault lags tokeninfo by a few seconds in counting the token expired; the
-next request does not wait, forces the expired token again, and reads
-consent as the grant gone. A sign-in detours through consent, as for any
-other consent request. This does not protect against a vault that judged
-"expired" by its own `expireTime` (once 4 hours out) and so answered every
-forced refresh of a spent token with consent: refreshes would then still
-sign people out hourly, one request later. The live check below (how soon
-after expiry the vault renews) settles it. steward waits once. A token still short after the wait, one a forced
-refresh brought, or one with 75 to 90 seconds left at sign-in is
-`server_error` at once.
+A token with less than `need` left can only be renewed by expiring.
+steward waits it out (its remaining life plus 3 seconds, cancelled with
+the request: at most 78 seconds at refresh, 93 at sign-in) and asks the
+vault again, plainly: a fresh token is used; the expired token handed back
+is refused by tokeninfo and forced, which the reference allows.
+
+Consent to a forced refresh is checked once more with a plain retrieve
+before it counts: another client of the same person may have forced the
+same expired token a moment earlier, and the vault may refuse the stale
+second force. A token other than the forced one that tokeninfo accepts
+with `need` left goes on to the full checks (account, scopes, email) and
+is used if it passes; anything else (consent again, pending, the same
+token, a refused or short one) leaves the verdict, and failing to ask
+(the vault or tokeninfo failing) is `server_error`. If the verdict stands and
+the forced token is the one this request waited out, a refresh gets
+`server_error`, not yet a sign-out, in case the vault lags tokeninfo by a
+few seconds in counting the token expired; the next request does not wait,
+forces the expired token again, and reads consent as the grant gone. A
+sign-in detours through consent, as for any other consent request. This
+does not protect against a vault that judged "expired" by its own
+`expireTime` (once 4 hours out) and so answered every forced refresh of a
+spent token with consent: refreshes would then still sign people out
+hourly, one request later. The live check below (how soon after expiry
+the vault renews) settles it.
+
+steward waits once. A token still short after the wait, or one a forced
+refresh brought, is `server_error` at once.
 
 The wait matters because an active client's refresh lands exactly in that
 window: its access token stopped a minute before the Google token, so it
@@ -534,29 +545,53 @@ What this ordering means:
   side, and rotate moments apart. Within `RefreshReuseGrace` the loser is
   refused without revoking and can re-read the winner's tokens from the
   shared store. Without a grace it revokes the family, as any concurrent
-  refresh does; that is #18's trade-off, unchanged, and the grace need not
-  cover the wait. If both force the same expired token, the vault may
-  refuse the second ("not the latest token"): `server_error`, nothing
-  rotated, and the retry finds the fresh token.
+  refresh does; that is #18's trade-off, unchanged. The grace need not
+  cover the wait as long as a refresh arriving during another's wait also
+  gets the nearly spent token and waits too. If the vault renews early
+  (before expiry, unverified), a later arrival can get a fresh token at
+  once and rotate while the first still waits, and the first then loses
+  the race by up to the rest of its wait: outside a short grace it revokes
+  the family. If both force the same expired token, the vault may refuse
+  the second ("not the latest token", or consent, which is checked again
+  as above): `server_error` at worst, nothing rotated, and the retry finds
+  the fresh token.
 - **The client going away, or a front end timing out, during the wait.**
   Nothing is rotated, so nothing is given back and the retry, on any
-  replica, works. kode-gopher's GKE Gateway allows 900 seconds; a shorter
-  front-end timeout turns that refresh into a retry, not a sign-out.
+  replica, works: no sign-out in steward's state. But a proxy's 504 is not
+  an OAuth error, and an MCP client may answer it with a browser sign-in,
+  so give the token endpoint, the sign-in callback and the consent return
+  a front-end timeout of at least 2 minutes (78 or 93 seconds of wait plus
+  the vault, tokeninfo and allow-list calls). Common defaults are shorter
+  (a Google Cloud load balancer's backend timeout is 30 seconds, nginx's
+  `proxy_read_timeout` and an AWS ALB's idle timeout 60); kode-gopher's
+  GKE Gateway allows 900 seconds.
 - **`http.Server.WriteTimeout` shorter than the wait.** Over HTTP/1.1 a
   write timeout does not cancel the request, so a refresh that waited and
   then rotated would have lost its answer, and the retry would be a
   replay. Before waiting, custody moves the response's write deadline
   past the wait plus 30 seconds (`http.ResponseController`), on the token
-  endpoint, the sign-in callback and the consent return. A
+  endpoint, the sign-in callback and the consent return, and the token
+  endpoint moves it 30 seconds past the rotation again, so slow vault
+  calls after the wait cannot use it up (with a `WriteTimeout` under 30
+  seconds, every refresh, waited or not, gets those 30 seconds). It only ever moves the server's
+  own deadline (`WriteTimeout` from the request's start) later: without a
+  `WriteTimeout` it sets none, and it never shortens a longer one. A
   `ResponseWriter` wrapped by middleware without `Unwrap` cannot be
-  extended; there, keep `WriteTimeout` above 108 seconds.
+  extended; there, keep `WriteTimeout` above 2 minutes.
 - **Shutdown or a pod killed mid-wait.** Nothing is rotated until the wait
   is over. `Shutdown` lets the handler finish (rotate and answer); a kill
   leaves nothing to give back. Only the moment between the rotation and
   the answer remains, as for every refresh.
 - **A replayed token** gets the vault work, wait included, before the
   rotation detects the replay and revokes the family. That costs vault
-  calls, never a token: nothing is issued for it.
+  calls, never a token: nothing is issued for it. But reuse detection now
+  needs the vault and Google up: while either fails (or answers
+  `pending`, or the request is cancelled), a replayed or revoked-family
+  token gets `server_error`, with no revocation and no "reused" log line,
+  until a request gets past `prepare`; and a client looping on a revoked
+  token costs a vault retrieve and a tokeninfo call per attempt rather
+  than a replay-cache lookup. A replay-cache peek before `prepare` (an
+  optional interface) would restore both; it is left for a follow-up.
 - **The grant ages** between step 2 and step 6 by the rotation and the
   allow-list check: a token prepared with 75 seconds left has 15 seconds
   of margin before the access token would be born expired, which
@@ -580,8 +615,9 @@ fresh, the wait never happens); how soon after tokeninfo's expiry a plain
 in which case the forced refresh of the expired token does it); whether
 forcing a valid token near expiry (1 minute left) also asks for consent;
 whether a consent answer to a forced valid token leaves a plain
-`retrieve` working; and what forcing a revoked token returns (consent, as
-the reference implies).
+`retrieve` working; what forcing a revoked token returns (consent, as
+the reference implies); and whether a forced refresh of a token another
+caller has just force-refreshed is refused or asks for consent.
 
 A grant only the user can repair is `access_denied` at sign-in and
 `invalid_grant` at refresh (the client signs the person in again): consent
@@ -589,10 +625,12 @@ declined, another account's grant, a missing scope, a changed email,
 Google's `invalid_grant` on a sealed refresh token, and a vault token
 tokeninfo refuses both before and after a forced refresh. The vault asking
 for consent (on a plain retrieve, after a token was waited out, or after
-forcing a token Google refused) is the consent detour at sign-in and
-`invalid_grant` at refresh, except consent to renew the token a refresh
-just waited out, which is `server_error` once (Vault renewal). Google or the vault failing is `server_error`,
-and at refresh gives the refresh token back, so a retry may work: no
+forcing a token Google refused, checked once more) is the consent detour
+at sign-in and `invalid_grant` at refresh, except consent to renew the
+token a refresh just waited out, which is `server_error` once (Vault
+renewal). Google or the vault failing is `server_error`, and at refresh
+gives the refresh token back (or, failing before the rotation, never
+took it), so a retry may work: no
 answer, any HTTP error from the vault, a tokeninfo answer other than 200
 or a 400 `invalid_token` (an egress proxy's 400 included), the vault
 answering `pending` (its API reference: "the caller should retry ... after
@@ -798,9 +836,11 @@ sealing the tokens fails; custody failures that are Google failing are
 answer (a sign-out before); a vault token Google still accepts is never
 force-refreshed (kode-gopher forces one with under 5 minutes left): it is
 used down to 75 seconds at refresh (90 at sign-in), and one
-with less is waited out and retrieved again (Vault renewal, above); a
+with less is waited out and retrieved again, before the refresh token's
+family is rotated (Vault renewal, above); a
 vault token tokeninfo refuses is force-refreshed once, then a consent
-detour at sign-in or a refusal, rather than `server_error`; client-resolution
+detour at sign-in or a refusal, rather than `server_error`;
+client-resolution
 errors (CIMD contents, dial errors) are not echoed; error descriptions
 keep to RFC 6749's character set; the SSRF filter also refuses NAT64, 6to4, Teredo
 and other special-purpose ranges; flow cookies are `__Host-` where

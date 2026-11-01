@@ -196,8 +196,10 @@ type Config struct {
 	// first wait out a nearly spent Google token (up to 78 seconds), but
 	// before the family is rotated: refreshes that arrive together wait
 	// together and still rotate moments apart, so the grace need not
-	// cover the wait. At most a minute: the window is time in which a
-	// stolen token's reuse is not detected.
+	// cover the wait, unless the vault renews tokens before they expire
+	// (not seen; see docs/DESIGN.md, Vault renewal), when a later arrival
+	// may rotate while an earlier one still waits. At most a minute: the
+	// window is time in which a stolen token's reuse is not detected.
 	RefreshReuseGrace time.Duration
 
 	// ServiceName names the service on the consent page. Empty means the

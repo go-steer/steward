@@ -104,6 +104,9 @@ func openErr(err error, desc string) *tokenError {
 }
 
 func (s *Server) handleToken(w http.ResponseWriter, r *http.Request) {
+	// Recorded first, as near the server's WriteTimeout deadline as the
+	// handler gets: a custody wait extends that deadline (withResponse).
+	ctx := withResponse(r.Context(), w)
 	if r.Method != http.MethodPost {
 		w.Header().Set("Allow", "POST, OPTIONS")
 		http.Error(w, "POST only", http.StatusMethodNotAllowed)
@@ -132,7 +135,7 @@ func (s *Server) handleToken(w http.ResponseWriter, r *http.Request) {
 	case "authorization_code":
 		resp, terr = s.exchangeCode(r, c)
 	case "refresh_token":
-		resp, terr = s.refreshTokens(withResponse(r.Context(), w), r, c)
+		resp, terr = s.refreshTokens(ctx, r, c)
 	case "client_credentials":
 		resp, terr = s.clientCredentials(r, c)
 	default:
@@ -315,6 +318,10 @@ func (s *Server) refreshTokens(ctx context.Context, r *http.Request, c *client) 
 		s.log.WarnContext(ctx, "authserver: custody failed at refresh", "custody", s.cfg.Custody.Name(), "email", p.User.Email, "err", preErr)
 		return nil, serverError("couldn't refresh the Google grant")
 	}
+	// From the rotation on, the answer must reach the client: a lost one
+	// makes its retry a replay. A long custody wait may have used up the
+	// server's write deadline, so give the rest of the request its own.
+	extendWriteDeadline(ctx, postWaitBudget)
 	// One expiry for the family and the token that will carry it, so the
 	// family is never forgotten before its newest token expires.
 	exp := s.now().Add(RefreshTTL)
