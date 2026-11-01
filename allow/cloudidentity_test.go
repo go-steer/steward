@@ -820,3 +820,93 @@ func TestGroupsForgetNameKeepsRefreshed(t *testing.T) {
 		t.Error("forgetName left the name it was asked to drop")
 	}
 }
+
+// A retry that reads a name another check has just cached is answered as
+// is: no second eviction and no lookup of its own, so a check never costs
+// more than one extra lookup however checks interleave. Here the other
+// check's name is planted while the stale one is being listed, and both
+// names answer 403. Ported from kode-gopher#54 (6cacac1), which found the
+// retried guard untested in both repos.
+func TestGroupsStaleNameRetryReadsRefreshedName(t *testing.T) {
+	t.Parallel()
+	var lookups atomic.Int32
+	now := time.Unix(1_800_000_000, 0)
+	c := &CloudIdentityGroups{now: func() time.Time { return now }}
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch {
+		case r.URL.Path == "/groups:lookup":
+			lookups.Add(1)
+			writeJSON(w, http.StatusOK, map[string]string{"name": "groups/looked-up"})
+		case strings.HasSuffix(r.URL.Path, ":checkTransitiveMembership"):
+			http.Error(w, `{"error":{"code":403,"message":"edition"}}`, http.StatusForbidden)
+		default:
+			if r.URL.Path == "/groups/old/memberships" {
+				c.mu.Lock()
+				c.names["g@d.example"] = cached[string]{v: "groups/other", at: now}
+				c.mu.Unlock()
+			}
+			http.Error(w, `{"error":{"code":403,"message":"Permission denied (or it may not exist)."}}`, http.StatusForbidden)
+		}
+	}))
+	t.Cleanup(srv.Close)
+	c.Client, c.Endpoint = srv.Client(), srv.URL+"/"
+	c.names = map[string]cached[string]{"g@d.example": {v: "groups/old", at: now}}
+	ok, err := c.IsMember(context.Background(), "g@d.example", "in@d.example")
+	if ok || err == nil || !strings.Contains(err.Error(), "HTTP 403") {
+		t.Errorf("IsMember = %v, %v; want an HTTP 403 error", ok, err)
+	}
+	if n := lookups.Load(); n != 0 {
+		t.Errorf("a retry on a name another check cached cost %d lookups, want 0", n)
+	}
+	c.mu.Lock()
+	got := c.names["g@d.example"].v
+	c.mu.Unlock()
+	if got != "groups/other" {
+		t.Errorf("cached name = %q, want the other check's groups/other kept", got)
+	}
+}
+
+// Only the group being checked can have a stale name: a nested group's
+// 403 or 404 leaves the root's cached name alone and makes the walk
+// incomplete, for every later check too. Ported from kode-gopher#54
+// (6cacac1).
+func TestGroupsNestedGoneNotStaleRoot(t *testing.T) {
+	t.Parallel()
+	for _, status := range []int{http.StatusNotFound, http.StatusForbidden} {
+		t.Run(http.StatusText(status), func(t *testing.T) {
+			t.Parallel()
+			var lookups atomic.Int32
+			srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				switch {
+				case r.URL.Path == "/groups:lookup":
+					lookups.Add(1)
+					writeJSON(w, http.StatusOK, map[string]string{"name": "groups/" + r.URL.Query().Get("groupKey.id")})
+				case strings.HasSuffix(r.URL.Path, ":checkTransitiveMembership"):
+					http.Error(w, `{"error":{"code":403,"message":"edition"}}`, http.StatusForbidden)
+				case r.URL.Path == "/groups/g@d.example/memberships":
+					writeJSON(w, http.StatusOK, map[string]any{"memberships": []any{
+						map[string]any{"preferredMemberKey": map[string]string{"id": "nested@d.example"}, "type": "GROUP"},
+					}})
+				default:
+					http.Error(w, fmt.Sprintf(`{"error":{"code":%d,"message":"Permission denied (or it may not exist)."}}`, status), status)
+				}
+			}))
+			t.Cleanup(srv.Close)
+			now := time.Unix(1_800_000_000, 0)
+			c := &CloudIdentityGroups{Client: srv.Client(), Endpoint: srv.URL + "/", now: func() time.Time { return now }}
+			for i := range 2 {
+				ok, err := c.IsMember(context.Background(), "g@d.example", "out@d.example")
+				if ok || err == nil || !strings.Contains(err.Error(), "incomplete") {
+					t.Errorf("check %d = %v, %v; want an incomplete-walk error", i, ok, err)
+				}
+			}
+			// The root and the nested group, once each.
+			if n := lookups.Load(); n != 2 {
+				t.Errorf("group lookups = %d, want 2 (root name kept)", n)
+			}
+			if e, ok := c.names["g@d.example"]; !ok || e.v != "groups/g@d.example" {
+				t.Errorf("root's cached name = %v, %v; want it kept", e, ok)
+			}
+		})
+	}
+}
