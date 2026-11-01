@@ -8,6 +8,12 @@ exported API" in [`CONTRIBUTING.md`](./CONTRIBUTING.md)).
 
 ## [Unreleased]
 
+*Nothing yet.*
+
+## [0.4.0] - 2026-11-01
+
+Hardening from the kode-gopher ports, and refresh fixes for vault custody and shared replay caches. Active vault-custody sessions no longer go back to sign-in every hour: a vault token Google still accepts is never force-refreshed, and a nearly spent one is waited out before the refresh family rotates, so a front end in front of `/token` and the sign-in callbacks needs a timeout of at least 2 minutes (see "Vault renewal" in `docs/DESIGN.md`). A shared `ReplayCache` can implement the new optional `RotationIDReplayCache` so a failed refresh gives back only its own rotation. Only Google's own verdict (tokeninfo 400 `invalid_token`, userinfo 401) is a refusal on either path; other answers are retryable. Consent pages clean client names, a recreated group's members are let back in, and the optional `Config.RefreshReuseGrace` (off by default) spares families reused by a concurrent refresh. The exported API changed additively only. Minor rather than patch because the refresh path's behaviour changed.
+
 ### Added
 
 - `authserver.Config.RefreshReuseGrace`, `authserver.GraceReplayCache`
@@ -445,7 +451,8 @@ come later.
   adversarial-review gate and agent-attribution check follow purser and
   supercargo. No exported API yet.
 
-[Unreleased]: https://github.com/go-steer/steward/compare/v0.3.0...HEAD
+[Unreleased]: https://github.com/go-steer/steward/compare/v0.4.0...HEAD
+[0.4.0]: https://github.com/go-steer/steward/releases/tag/v0.4.0
 [0.3.0]: https://github.com/go-steer/steward/releases/tag/v0.3.0
 [0.2.0]: https://github.com/go-steer/steward/releases/tag/v0.2.0
 [0.1.0]: https://github.com/go-steer/steward/releases/tag/v0.1.0
