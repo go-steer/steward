@@ -401,12 +401,23 @@ func newAdmitter(t *testing.T, groups allow.GroupChecker) *allow.Admitter {
 
 func newTestEnv(t *testing.T, sealed bool, mutate func(*Config)) *testEnv {
 	t.Helper()
+	return newTestEnvServer(t, sealed, mutate, nil)
+}
+
+// newTestEnvServer is newTestEnv with srvMutate applied to the server
+// before it starts (a WriteTimeout, a handler wrapped around the mux).
+func newTestEnvServer(t *testing.T, sealed bool, mutate func(*Config), srvMutate func(*http.Server)) *testEnv {
+	t.Helper()
 	e := &testEnv{t: t, google: newFakeGoogle(t), log: &syncBuffer{}, groups: &fakeGroups{members: map[string]map[string]bool{
 		"kg-users@example.com": {"bob@other.org": true},
 	}}}
 	e.vault = newFakeVault(t, e.google)
 	mux := http.NewServeMux()
-	e.srv = httptest.NewServer(mux)
+	e.srv = httptest.NewUnstartedServer(mux)
+	if srvMutate != nil {
+		srvMutate(e.srv.Config)
+	}
+	e.srv.Start()
 	t.Cleanup(e.srv.Close)
 	var custody Custody = e.vault.custody()
 	if sealed {

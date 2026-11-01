@@ -505,7 +505,8 @@ func TestSealedCustodyRefreshScopes(t *testing.T) {
 }
 
 // vaultOverride answers the vault's next retrieve calls with canned
-// bodies, and hands every other call to the fake vault.
+// bodies, and hands every other call to the fake vault, as it does a
+// retrieve whose answer is "-".
 type vaultOverride struct {
 	next http.RoundTripper
 
@@ -522,6 +523,9 @@ func (o *vaultOverride) RoundTrip(r *http.Request) (*http.Response, error) {
 	body := o.retrieves[0]
 	o.retrieves = o.retrieves[1:]
 	o.mu.Unlock()
+	if body == "-" {
+		return o.next.RoundTrip(r)
+	}
 	if r.Body != nil {
 		_ = r.Body.Close()
 	}
@@ -739,26 +743,41 @@ func TestVaultConcurrentRefreshDuringTheWait(t *testing.T) {
 	e.google.mu.Unlock()
 	overrideVault(e, `{"success":{"token":"`+last+`"}}`)
 	vc := e.as.cfg.Custody.(*VaultCustody)
-	waiting, release := make(chan struct{}), make(chan struct{})
+	waiting, held := make(chan struct{}), make(chan struct{})
+	var releaseOnce sync.Once
+	release := func() { releaseOnce.Do(func() { close(held) }) }
+	// A failed assertion must not leave the first refresh held: it is in
+	// flight on e.srv, whose Close (a cleanup) waits for it.
+	t.Cleanup(release)
 	vc.sleeper = &sleeper{func(ctx context.Context, d time.Duration) error {
 		close(waiting)
 		select {
-		case <-release:
+		case <-held:
 		case <-ctx.Done():
 			return ctx.Err()
 		}
 		return e.vault.sleep(ctx, d)
 	}}
 	firstDone := make(chan tokenResp, 1)
-	go func() { firstDone <- e.token(refreshForm(id, first.Refresh), "", "") }()
+	go func() {
+		// Not e.token: its t.Fatal must not run off the test's goroutine,
+		// where it would leave firstDone empty.
+		firstDone <- tokenOver(e.srv.URL, refreshForm(id, first.Refresh))
+	}()
 	select {
 	case <-waiting:
 	case r := <-firstDone:
 		t.Fatalf("the first refresh answered (%+v) without waiting out the nearly spent token", r)
+	case <-time.After(10 * time.Second):
+		t.Fatal("timed out waiting for the first refresh to reach the wait")
 	}
-	second := e.token(refreshForm(id, first.Refresh), "", "")
-	close(release)
-	r1 := <-firstDone
+	// Off the test goroutine and awaited, so a refresh that blocks behind
+	// the held one fails the test rather than hanging it.
+	secondDone := make(chan tokenResp, 1)
+	go func() { secondDone <- tokenOver(e.srv.URL, refreshForm(id, first.Refresh)) }()
+	second := await(t, secondDone, "a refresh during the first one's wait")
+	release()
+	r1 := await(t, firstDone, "the first refresh")
 	if second.status != http.StatusOK {
 		t.Fatalf("a refresh during another's wait: %+v, want it to refresh: the family is not rotated during the wait", second)
 	}
@@ -770,38 +789,214 @@ func TestVaultConcurrentRefreshDuringTheWait(t *testing.T) {
 	}
 }
 
-// A server WriteTimeout shorter than the wait does not lose the answer:
-// the wait moves the response's write deadline past it. (Over HTTP/1.1 a
-// write timeout does not cancel the request, so a lost answer to a
-// refresh that went on to rotate its family would make the client's
-// retry a replay.) This test really waits, about 4 seconds.
-func TestVaultWaitOutlastsWriteTimeout(t *testing.T) {
-	t.Parallel()
-	e := newTestEnv(t, false, nil)
-	id, first := e.signIn(newBrowser(t))
-	e.google.mu.Lock()
-	last := e.google.mint(alice, ScopeOpenID+" "+ScopeEmail+" "+ScopeCloudPlatform, 1)
-	e.google.mu.Unlock()
-	overrideVault(e, `{"success":{"token":"`+last+`"}}`)
-	e.as.cfg.Custody.(*VaultCustody).sleeper = nil // a real wait
-	ts := httptest.NewUnstartedServer(e.srv.Config.Handler)
-	ts.Config.WriteTimeout = 500 * time.Millisecond
-	ts.Start()
-	t.Cleanup(ts.Close)
-	req, _ := http.NewRequest(http.MethodPost, ts.URL+"/token", strings.NewReader(refreshForm(id, first.Refresh).Encode()))
+// tokenOver posts form to the token endpoint at base without failing the
+// test, so it can run off the test's goroutine.
+func tokenOver(base string, form url.Values) tokenResp {
+	req, _ := http.NewRequest(http.MethodPost, base+PathToken, strings.NewReader(form.Encode()))
 	req.Header.Set("Content-Type", "application/x-www-form-urlencoded")
 	resp, err := hc.Do(req)
 	if err != nil {
-		t.Fatalf("refresh behind a 500 ms WriteTimeout: %v, want the answer", err)
+		return tokenResp{Error: "transport: " + err.Error()}
 	}
 	defer func() { _ = resp.Body.Close() }()
-	var r tokenResp
+	r := tokenResp{status: resp.StatusCode, header: resp.Header}
 	_ = json.NewDecoder(resp.Body).Decode(&r)
-	if resp.StatusCode != http.StatusOK || r.Refresh == "" {
-		t.Fatalf("refresh behind a 500 ms WriteTimeout: %d %+v", resp.StatusCode, r)
+	return r
+}
+
+// A server WriteTimeout shorter than the wait does not lose the answer:
+// the wait moves the response's write deadline past it, and the token
+// endpoint moves it again before rotating. Over HTTP/1.1 a write timeout
+// does not cancel the request, so a lost answer to a refresh that went on
+// to rotate its family would make the client's retry a replay; there the
+// second extension alone saves the answer, so the HTTP/1.1 case passes
+// without the wait's own. Over HTTP/2 a write timeout resets the stream
+// (INTERNAL_ERROR), which cancels the request: without the wait's
+// extension every waiting refresh fails. TestVaultWaitExtendsWriteDeadline
+// pins that extension directly. The timeout is 2 s, half the wait: the
+// TLS handshake runs under it too, and must beat it on a loaded machine.
+// Each case really waits, about 4 seconds.
+func TestVaultWaitOutlastsWriteTimeout(t *testing.T) {
+	t.Parallel()
+	for _, h2 := range []bool{false, true} {
+		t.Run(map[bool]string{false: "HTTP/1.1", true: "HTTP/2"}[h2], func(t *testing.T) {
+			t.Parallel()
+			e := newTestEnv(t, false, nil)
+			id, first := e.signIn(newBrowser(t))
+			e.google.mu.Lock()
+			last := e.google.mint(alice, ScopeOpenID+" "+ScopeEmail+" "+ScopeCloudPlatform, 1)
+			e.google.mu.Unlock()
+			overrideVault(e, `{"success":{"token":"`+last+`"}}`)
+			e.as.cfg.Custody.(*VaultCustody).sleeper = nil // a real wait
+			ts := httptest.NewUnstartedServer(e.srv.Config.Handler)
+			ts.Config.WriteTimeout = 2 * time.Second
+			client := hc
+			if h2 {
+				ts.EnableHTTP2 = true
+				ts.StartTLS()
+				client = ts.Client()
+			} else {
+				ts.Start()
+			}
+			t.Cleanup(ts.Close)
+			req, _ := http.NewRequest(http.MethodPost, ts.URL+PathToken, strings.NewReader(refreshForm(id, first.Refresh).Encode()))
+			req.Header.Set("Content-Type", "application/x-www-form-urlencoded")
+			resp, err := client.Do(req)
+			if err != nil {
+				t.Fatalf("refresh behind a 2 s WriteTimeout: %v, want the answer", err)
+			}
+			defer func() { _ = resp.Body.Close() }()
+			var r tokenResp
+			_ = json.NewDecoder(resp.Body).Decode(&r)
+			if resp.StatusCode != http.StatusOK || r.Refresh == "" || resp.ProtoMajor != map[bool]int{false: 1, true: 2}[h2] {
+				t.Fatalf("refresh behind a 2 s WriteTimeout: %s %d %+v", resp.Proto, resp.StatusCode, r)
+			}
+			if r2 := e.token(refreshForm(id, r.Refresh), "", ""); r2.status != http.StatusOK {
+				t.Errorf("the answered refresh token: %+v", r2)
+			}
+		})
 	}
-	if r2 := e.token(refreshForm(id, r.Refresh), "", ""); r2.status != http.StatusOK {
-		t.Errorf("the answered refresh token: %+v", r2)
+}
+
+// A server ReadTimeout shorter than the wait does not cancel it: once a
+// request's body is read (or it has none), net/http clears the read
+// deadline for the background read that watches for the client going
+// away (HTTP/1.1, connReader.startBackgroundRead in go1.26.10), and over
+// HTTP/2 the timeout only closes the request body
+// (http2stream.onReadTimeout). DESIGN.md says so; this pins it. The
+// timeout is 2 s, half the wait, as in TestVaultWaitOutlastsWriteTimeout.
+// Each case really waits, about 4 seconds.
+func TestVaultWaitOutlastsReadTimeout(t *testing.T) {
+	t.Parallel()
+	for _, h2 := range []bool{false, true} {
+		t.Run(map[bool]string{false: "HTTP/1.1", true: "HTTP/2"}[h2], func(t *testing.T) {
+			t.Parallel()
+			e := newTestEnv(t, false, nil)
+			id, first := e.signIn(newBrowser(t))
+			e.google.mu.Lock()
+			last := e.google.mint(alice, ScopeOpenID+" "+ScopeEmail+" "+ScopeCloudPlatform, 1)
+			e.google.mu.Unlock()
+			overrideVault(e, `{"success":{"token":"`+last+`"}}`)
+			e.as.cfg.Custody.(*VaultCustody).sleeper = nil // a real wait
+			ts := httptest.NewUnstartedServer(e.srv.Config.Handler)
+			ts.Config.ReadTimeout = 2 * time.Second
+			client := hc
+			if h2 {
+				ts.EnableHTTP2 = true
+				ts.StartTLS()
+				client = ts.Client()
+			} else {
+				ts.Start()
+			}
+			t.Cleanup(ts.Close)
+			req, _ := http.NewRequest(http.MethodPost, ts.URL+PathToken, strings.NewReader(refreshForm(id, first.Refresh).Encode()))
+			req.Header.Set("Content-Type", "application/x-www-form-urlencoded")
+			start := time.Now()
+			resp, err := client.Do(req)
+			if err != nil {
+				t.Fatalf("refresh behind a 2 s ReadTimeout: %v, want the answer", err)
+			}
+			defer func() { _ = resp.Body.Close() }()
+			var r tokenResp
+			_ = json.NewDecoder(resp.Body).Decode(&r)
+			if resp.StatusCode != http.StatusOK || r.Refresh == "" || resp.ProtoMajor != map[bool]int{false: 1, true: 2}[h2] {
+				t.Fatalf("refresh behind a 2 s ReadTimeout: %s %d %+v, want the wait to finish", resp.Proto, resp.StatusCode, r)
+			}
+			if took := time.Since(start); took < 3*time.Second {
+				t.Errorf("refresh took %v: it did not wait out the nearly spent token", took)
+			}
+		})
+	}
+}
+
+// At sign-in only the wait's own extension stands between a WriteTimeout
+// shorter than the wait and the redirect: at the callback (the stored
+// grant's token nearly spent) and at the consent return (the token after
+// consent nearly spent). Over HTTP/1.1 the redirect would be lost, the
+// sign-in with it. The WriteTimeout covers every request of the sign-in,
+// so it is 2 s, half the wait: the requests that do not wait must still
+// beat it on a loaded machine. Each case really waits, about 4 seconds.
+func TestVaultSignInWaitOutlastsWriteTimeout(t *testing.T) {
+	t.Parallel()
+	for _, consent := range []bool{false, true} {
+		t.Run(map[bool]string{false: "callback", true: "consent return"}[consent], func(t *testing.T) {
+			t.Parallel()
+			e := newTestEnvServer(t, false, nil, func(s *http.Server) { s.WriteTimeout = 2 * time.Second })
+			e.google.mu.Lock()
+			last := e.google.mint(alice, ScopeOpenID+" "+ScopeEmail+" "+ScopeCloudPlatform, 1)
+			e.google.mu.Unlock()
+			if consent {
+				// No grant stored: the callback's retrieve reaches the fake
+				// vault, which asks for consent, and the one after consent
+				// gets the nearly spent token.
+				overrideVault(e, "-", `{"success":{"token":"`+last+`"}}`)
+			} else {
+				e.signIn(newBrowser(t)) // the vault holds alice's grant
+				overrideVault(e, `{"success":{"token":"`+last+`"}}`)
+			}
+			e.as.cfg.Custody.(*VaultCustody).sleeper = nil // a real wait
+			id, v := e.register(), rand.Text()+rand.Text()
+			b := newBrowser(t)
+			// A fresh connection per request: the client retries a GET that
+			// fails on a reused connection, which would hide a lost answer.
+			b.hc.Transport = &http.Transport{DisableKeepAlives: true}
+			start := time.Now()
+			loc, page := b.visit(e.authorizeURL(id, v, nil))
+			if loc == nil || loc.Query().Get("code") == "" {
+				t.Fatalf("sign-in behind a 2 s WriteTimeout: %v %q, want a code", loc, page)
+			}
+			if took := time.Since(start); took < 3*time.Second {
+				t.Fatalf("sign-in took %v: it did not wait out the nearly spent token", took)
+			}
+			if r := e.token(exchangeForm(id, loc.Query().Get("code"), v), "", ""); r.status != http.StatusOK || r.Expires < int64((AccessTTL-time.Minute).Seconds()) {
+				t.Errorf("exchange %+v, want a fresh Google token's access token", r)
+			}
+		})
+	}
+}
+
+// The wait itself moves the write deadline past the wait and
+// postWaitBudget. The sign-in callback and the consent return rely on it
+// alone; the token endpoint extends again before rotating, which is why
+// the HTTP/1.1 case of TestVaultWaitOutlastsWriteTimeout passes without
+// it.
+func TestVaultWaitExtendsWriteDeadline(t *testing.T) {
+	t.Parallel()
+	ctx := context.WithValue(context.Background(), http.ServerContextKey, &http.Server{WriteTimeout: time.Second})
+	w := &deadlineWriter{}
+	ctx = withResponse(ctx, w)
+	v := &VaultCustody{sleeper: &sleeper{func(context.Context, time.Duration) error { return nil }}}
+	if err := v.wait(ctx, time.Minute); err != nil {
+		t.Fatal(err)
+	}
+	if len(w.set) != 1 || time.Until(w.set[0]) < time.Minute+postWaitBudget-time.Second {
+		t.Errorf("deadlines set %v, want one past the wait and postWaitBudget", w.set)
+	}
+}
+
+// A refusal found in prepare (here the vault holding another account's
+// grant) is answered only after the allow-list check: if that check
+// fails, the answer is server_error and the rotation is given back, so
+// the retry, with the directory and the vault answering properly, works.
+// Ported from kode-gopher (TestVaultRefusalWaitsForTheAllowList, 69575ef).
+func TestVaultRefusalWaitsForTheAllowList(t *testing.T) {
+	t.Parallel()
+	e := newTestEnv(t, false, nil)
+	e.google.signInAs, e.vault.consentAs = bob, bob // admitted by group
+	id, first := e.signIn(newBrowser(t))
+	e.google.mu.Lock()
+	other := e.google.mint(mallory, ScopeOpenID+" "+ScopeEmail+" "+ScopeCloudPlatform, 3600)
+	e.google.mu.Unlock()
+	overrideVault(e, `{"success":{"token":"`+other+`"}}`)
+	// A fresh admitter, so no membership it cached at sign-in answers for
+	// the directory.
+	e.as.cfg.Admit = newAdmitter(t, &fakeGroups{failNext: 1})
+	if r := e.token(refreshForm(id, first.Refresh), "", ""); r.Error != "server_error" {
+		t.Fatalf("refresh, the vault refusing and the allow-list failing: %+v, want server_error", r)
+	}
+	e.as.cfg.Admit = newAdmitter(t, e.groups)
+	if r := e.token(refreshForm(id, first.Refresh), "", ""); r.status != http.StatusOK {
+		t.Errorf("retry: %+v, want the rotation given back", r)
 	}
 }
 
