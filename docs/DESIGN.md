@@ -562,7 +562,16 @@ What this ordering means:
   the fresh token.
 - **The client going away, or a front end timing out, during the wait.**
   Nothing is rotated, so nothing is given back and the retry, on any
-  replica, works: no sign-out in steward's state. But a proxy's 504 is not
+  replica, works: no sign-out in steward's state. That needs steward to
+  see the request end: the client's connection closing, or the front end
+  closing or cancelling its backend request. A front end that answers
+  the client with its timeout but keeps the backend request open lets
+  the wait finish and the family rotate, and that answer goes nowhere.
+  The client's retry then presents a refresh token the abandoned request
+  spent: a replay, `invalid_grant` (the family revoked, or within
+  `RefreshReuseGrace` refused and kept, but the tokens it was rotated to
+  are lost either way), or, if it arrives during the wait, a concurrent
+  refresh (above). Either way, a proxy's 504 is not
   an OAuth error, and an MCP client may answer it with a browser sign-in,
   so give the token endpoint, the sign-in callback and the consent return
   a front-end timeout of at least 2 minutes (78 or 93 seconds of wait plus
@@ -573,7 +582,9 @@ What this ordering means:
 - **`http.Server.WriteTimeout` shorter than the wait.** Over HTTP/1.1 a
   write timeout does not cancel the request, so a refresh that waited and
   then rotated would have lost its answer, and the retry would be a
-  replay. Before waiting, custody moves the response's write deadline
+  replay. Over HTTP/2 it resets the stream, which cancels the request:
+  every waiting refresh and sign-in would fail, nothing rotated.
+  Before waiting, custody moves the response's write deadline
   past the wait plus 30 seconds (`http.ResponseController`), on the token
   endpoint, the sign-in callback and the consent return, and the token
   endpoint moves it 30 seconds past the rotation again, so slow vault
@@ -583,6 +594,14 @@ What this ordering means:
   `WriteTimeout` it sets none, and it never shortens a longer one. A
   `ResponseWriter` wrapped by middleware without `Unwrap` cannot be
   extended; there, keep `WriteTimeout` above 2 minutes.
+- **`http.Server.ReadTimeout` shorter than the wait** does not cancel it,
+  in the Go this module requires (1.26.10): once the request body is read
+  (sign-in requests have none; the token endpoint reads its form before
+  any custody work), HTTP/1.1 clears the read deadline for the background
+  read that watches for the client going away, and over HTTP/2 the
+  timeout only closes the request body (`connReader.startBackgroundRead`
+  and `http2stream.onReadTimeout` in net/http).
+  `TestVaultWaitOutlastsReadTimeout` pins the HTTP/1.1 case.
 - **Shutdown or a pod killed mid-wait.** Nothing is rotated until the wait
   is over. `Shutdown` lets the handler finish (rotate and answer); a kill
   leaves nothing to give back. Only the moment between the rotation and
