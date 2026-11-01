@@ -39,6 +39,7 @@ import (
 	"strings"
 	"sync"
 	"testing"
+	"time"
 
 	"github.com/go-steer/purser"
 	"github.com/go-steer/purser/httpmw"
@@ -205,7 +206,8 @@ type fakeVault struct {
 	grants    map[string]User   // userId -> account whose grant is stored
 	shortLife bool              // retrieve hands out nearly spent tokens
 	forced    int
-	failNext  int // fail this many API calls (an outage)
+	failNext  int             // fail this many API calls (an outage)
+	waits     []time.Duration // nearly spent tokens VaultCustody waited out
 }
 
 func newFakeVault(t *testing.T, g *fakeGoogle) *fakeVault {
@@ -219,7 +221,26 @@ func newFakeVault(t *testing.T, g *fakeGoogle) *fakeVault {
 }
 
 func (v *fakeVault) custody() *VaultCustody {
-	return &VaultCustody{AuthProvider: "projects/p/locations/l/authProviders/kg", Client: v.srv.Client(), Endpoint: v.srv.URL + "/v1/"}
+	return &VaultCustody{AuthProvider: "projects/p/locations/l/authProviders/kg", Client: v.srv.Client(), Endpoint: v.srv.URL + "/v1/", sleeper: &sleeper{v.sleep}}
+}
+
+// sleep stands in for VaultCustody waiting out a nearly spent token: it
+// records the wait, and when it is over every token minted with no more
+// life than that has expired (tokeninfo refuses it) and the vault renews
+// with full-life tokens.
+func (v *fakeVault) sleep(_ context.Context, d time.Duration) error {
+	v.mu.Lock()
+	defer v.mu.Unlock()
+	v.waits = append(v.waits, d)
+	v.shortLife = false
+	v.g.mu.Lock()
+	defer v.g.mu.Unlock()
+	for tok, ft := range v.g.tokens {
+		if time.Duration(ft.life)*time.Second <= d {
+			delete(v.g.tokens, tok)
+		}
+	}
+	return nil
 }
 
 func (v *fakeVault) grantFor(sub string) (User, bool) {
@@ -253,13 +274,18 @@ func (v *fakeVault) api(w http.ResponseWriter, r *http.Request) {
 			http.Error(w, "scopes don't match the stored grant", http.StatusBadRequest)
 			return
 		}
-		if u, ok := v.grants[body.UserID]; ok {
+		v.g.mu.Lock()
+		_, live := v.g.tokens[body.ForceRefreshToken]
+		v.g.mu.Unlock()
+		if body.ForceRefreshToken != "" {
+			v.forced++
+		}
+		// Like the real vault (kode-gopher's spike), a forced refresh of a
+		// token that is still valid asks for consent.
+		if u, ok := v.grants[body.UserID]; ok && !live {
 			life := 3600
 			if v.shortLife && body.ForceRefreshToken == "" {
 				life = 60
-			}
-			if body.ForceRefreshToken != "" {
-				v.forced++
 			}
 			v.g.mu.Lock()
 			tok := v.g.mint(u, strings.Join(body.Scopes, " "), life)

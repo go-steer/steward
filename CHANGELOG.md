@@ -141,12 +141,29 @@ exported API" in [`CONTRIBUTING.md`](./CONTRIBUTING.md)).
   refresh. It is `server_error` now (the refresh token is given back for
   the retry), and `server_error`, not `access_denied`, at sign-in: the
   vault's API reference says to retry a `pending` answer.
-- **`authserver`: a nearly spent vault token no longer signs people out.**
-  A vault token with under 5 minutes left is force-refreshed, and the vault
+- **`authserver`: a nearly spent vault token no longer signs people out,
+  and an active client's hourly refresh no longer fails.** `VaultCustody`
+  force-refreshed a vault token with under 5 minutes left, and the vault
   answers a forced refresh of a token that is still valid by asking for
-  consent; that was `invalid_grant`. When forcing a valid token brings no
-  better one, short of a refusal, the valid token is now used if it has 3
-  minutes left, and the answer is otherwise `server_error`.
+  consent (kode-gopher's vault spike; its API reference says to force only
+  an "expired or invalid" token); that was `invalid_grant`. A token Google
+  still accepts is now never force-refreshed. It is used while it has 75
+  seconds left at refresh, or 90 at sign-in (the code is exchanged a
+  moment later), and the access token stops a minute before it, as
+  before. One with less is waited out (at most 78 seconds plus the vault
+  and tokeninfo calls, cancelled with the request) and the vault asked
+  again, which renews an expired token; the expired token handed back is
+  force-refreshed (at refresh, consent then is `server_error` this once,
+  in case the vault lags Google by a few seconds; the next refresh reads
+  it as the grant gone). An active client refreshes when its Google token has a minute
+  left, so this refresh used to be `server_error`, which the MCP
+  TypeScript SDK answers with a new browser sign-in, every hour; it now
+  takes up to about a minute instead. The front end in front of the token
+  endpoint and the sign-in callback, and any `http.Server.WriteTimeout`,
+  must allow that long; the refresh token's family stays rotated during
+  the wait (`docs/DESIGN.md`, Vault renewal, lists what that costs). A
+  token too short to use and not waited out is `server_error`, never a
+  sign-out.
 - **`authserver`: a vault token Google's tokeninfo refuses is a refusal.**
   A 400 `invalid_token` from tokeninfo was `server_error`. The token is now
   force-refreshed once (it may have expired before the vault's
@@ -156,6 +173,12 @@ exported API" in [`CONTRIBUTING.md`](./CONTRIBUTING.md)).
   Other tokeninfo failures stay `server_error`.
 - **`authserver`: a vault error that quotes a forced token back** has the
   token replaced before the error is logged.
+- **`authserver`: only Google's `invalid_token` verdict is Google refusing
+  a vault token.** A tokeninfo 400 counted as Google refusing whatever its
+  body said, so an egress proxy's 400 could force a refresh or, after one,
+  sign the person out. A 400 now needs `error` `invalid_token` in its JSON
+  body (as Google sends it, and as kode-gopher already checks); any other
+  is `server_error`.
 
 ## [0.3.0] - 2026-10-20
 

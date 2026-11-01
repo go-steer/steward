@@ -17,15 +17,19 @@ package authserver
 import (
 	"context"
 	"crypto/rand"
+	"encoding/json"
 	"errors"
 	"io"
+	"maps"
 	"net/http"
 	"net/http/httptest"
 	"net/url"
+	"slices"
 	"strconv"
 	"strings"
 	"sync"
 	"testing"
+	"time"
 )
 
 // scriptedVault answers retrieve and finalize from a script, one answer
@@ -34,14 +38,43 @@ type scriptedVault struct {
 	mu      sync.Mutex
 	answers []string // JSON bodies (or "!503" for an outage, "!400 <message>" for a refused call)
 	calls   []string
+	forced  []string          // forceRefreshToken of each call ("" if none)
+	waits   []time.Duration   // nearly spent tokens waited out
+	info    map[string]string // tokeninfo answers, by token
+	expire  bool              // a wait expires the tokens it outlasts
 }
 
-func (v *scriptedVault) handler(t *testing.T, info map[string]string) http.Handler {
+// sleep stands in for waiting out a nearly spent token: it records the
+// wait and, if v.expire, expires every token with no more life than that.
+func (v *scriptedVault) sleep(_ context.Context, d time.Duration) error {
+	v.mu.Lock()
+	defer v.mu.Unlock()
+	v.waits = append(v.waits, d)
+	for tok, body := range v.info {
+		var ti struct {
+			ExpiresIn string `json:"expires_in"`
+		}
+		if json.Unmarshal([]byte(body), &ti) != nil {
+			continue
+		}
+		if secs, err := strconv.Atoi(ti.ExpiresIn); err == nil && v.expire && time.Duration(secs)*time.Second <= d {
+			delete(v.info, tok)
+		}
+	}
+	return nil
+}
+
+func (v *scriptedVault) handler(t *testing.T) http.Handler {
 	mux := http.NewServeMux()
 	mux.HandleFunc("POST /v1/", func(w http.ResponseWriter, r *http.Request) {
+		var body struct {
+			ForceRefreshToken string `json:"forceRefreshToken"`
+		}
+		_ = json.NewDecoder(r.Body).Decode(&body)
 		v.mu.Lock()
 		defer v.mu.Unlock()
 		v.calls = append(v.calls, r.URL.Path[strings.LastIndex(r.URL.Path, ":")+1:])
+		v.forced = append(v.forced, body.ForceRefreshToken)
 		if len(v.answers) == 0 {
 			t.Errorf("unscripted vault call %s", r.URL.Path)
 			http.Error(w, "unscripted", http.StatusInternalServerError)
@@ -63,7 +96,9 @@ func (v *scriptedVault) handler(t *testing.T, info map[string]string) http.Handl
 	})
 	mux.HandleFunc("POST /tokeninfo", func(w http.ResponseWriter, r *http.Request) {
 		_ = r.ParseForm()
-		body, ok := info[r.PostForm.Get("access_token")]
+		v.mu.Lock()
+		body, ok := v.info[r.PostForm.Get("access_token")]
+		v.mu.Unlock()
 		if !ok {
 			http.Error(w, `{"error":"invalid_token","error_description":"Invalid Value"}`, http.StatusBadRequest)
 			return
@@ -77,12 +112,15 @@ func (v *scriptedVault) handler(t *testing.T, info map[string]string) http.Handl
 	return mux
 }
 
+// newScripted is a VaultCustody in front of a scripted vault whose
+// tokeninfo answers from a copy of info. Waiting out a nearly spent token
+// takes no time and, as it would, expires the tokens it outlasts.
 func newScripted(t *testing.T, info map[string]string, answers ...string) (*VaultCustody, *upstream, *scriptedVault) {
-	v := &scriptedVault{answers: answers}
-	srv := httptest.NewServer(v.handler(t, info))
+	v := &scriptedVault{answers: answers, info: maps.Clone(info), expire: true}
+	srv := httptest.NewServer(v.handler(t))
 	t.Cleanup(srv.Close)
 	g := &upstream{client: &GoogleClient{TokenInfoURL: srv.URL + "/tokeninfo"}, hc: srv.Client(), scopes: []string{ScopeCloudPlatform}}
-	return &VaultCustody{AuthProvider: "projects/p/locations/l/authProviders/kg", Client: srv.Client(), Endpoint: srv.URL + "/v1/"}, g, v
+	return &VaultCustody{AuthProvider: "projects/p/locations/l/authProviders/kg", Client: srv.Client(), Endpoint: srv.URL + "/v1/", sleeper: &sleeper{v.sleep}}, g, v
 }
 
 const (
@@ -96,11 +134,14 @@ var vaultInfo = map[string]string{
 	"tokShort":  `{"sub":"111","scope":"https://www.googleapis.com/auth/cloud-platform","expires_in":"30"}`,
 	"tokShort2": `{"sub":"111","scope":"https://www.googleapis.com/auth/cloud-platform","expires_in":"40"}`,
 	"tokMid":    `{"sub":"111","scope":"https://www.googleapis.com/auth/cloud-platform","expires_in":"240"}`,
+	"tok100":    `{"sub":"111","scope":"https://www.googleapis.com/auth/cloud-platform","expires_in":"100"}`,
+	"tok80":     `{"sub":"111","scope":"https://www.googleapis.com/auth/cloud-platform","expires_in":"80"}`,
 	"tokBob":    `{"sub":"222","scope":"https://www.googleapis.com/auth/cloud-platform","expires_in":"3600"}`,
 	"tokNoCP":   `{"sub":"111","scope":"openid","expires_in":"3600"}`,
 	"tokNoSub":  `{"scope":"openid","expires_in":"3600"}`,
 	"tokBadExp": `{"sub":"111","scope":"openid","expires_in":"soon"}`,
 	"tokProxy":  "!403", // tokeninfo answers 403: an egress proxy, not Google
+	"tokProxy4": "!400", // a 400 that is not Google's invalid_token
 	"tokMoved":  "!404",
 	"tokDown":   "!502",
 }
@@ -177,10 +218,23 @@ func TestVaultCustodyEdges(t *testing.T) {
 		"bad expiry":          {[]string{`{"success":{"token":"tokBadExp"}}`}, false},
 		"outage":              {[]string{"!503"}, false},
 		"malformed":           {[]string{`{`}, false},
-		"short, still short":  {[]string{tokShort, `{"success":{"token":"tokShort2"}}`}, false},
-		"short, same token":   {[]string{tokShort, tokShort}, false},
-		"short, then outage":  {[]string{tokShort, "!503"}, false},
-		"short, then refused": {[]string{tokShort, `{"success":{"token":"tokGone"}}`}, false},
+		// A nearly spent token is waited out, then the vault asked again
+		// (plainly): another short token, an outage or the vault busy is
+		// a failure; consent, the grant gone. The expired token back is
+		// force-refreshed, as is any token Google refuses.
+		"short, still short":           {[]string{tokShort, `{"success":{"token":"tokShort2"}}`}, false},
+		"short, then outage":           {[]string{tokShort, "!503"}, false},
+		"short, then consent":          {[]string{tokShort, consentAnswer}, true},
+		"short, then declined":         {[]string{tokShort, `{"consentRejected":{}}`}, true},
+		"short, then refused, consent": {[]string{tokShort, `{"success":{"token":"tokGone"}}`, consentAnswer}, true},
+		"short, then refused, outage":  {[]string{tokShort, `{"success":{"token":"tokGone"}}`, "!503"}, false},
+		// Consent to renew the token steward itself waited out is not
+		// yet read as the grant gone (a vault judging expiry by its own
+		// expireTime would answer so for a live grant).
+		"short, expired back, consent":     {[]string{tokShort, tokShort, consentAnswer}, false},
+		"short, expired back, same token":  {[]string{tokShort, tokShort, tokShort}, false},
+		"short, expired back, pending":     {[]string{tokShort, tokShort, `{"pending":{}}`}, false},
+		"short, expired back, still short": {[]string{tokShort, tokShort, `{"success":{"token":"tokShort2"}}`}, false},
 		// The vault busy is not the grant gone.
 		"pending":             {[]string{`{"pending":{}}`}, false},
 		"empty":               {[]string{`{}`}, false},
@@ -195,13 +249,16 @@ func TestVaultCustodyEdges(t *testing.T) {
 		"refused, then outage":  {[]string{`{"success":{"token":"tokGone"}}`, "!503"}, false},
 		"refused, then pending": {[]string{`{"success":{"token":"tokGone"}}`, `{"pending":{}}`}, false},
 		"refused, then short":   {[]string{`{"success":{"token":"tokGone"}}`, tokShort}, false},
+		"refused, then 400":     {[]string{`{"success":{"token":"tokGone"}}`, `{"success":{"token":"tokProxy4"}}`}, false},
 		"refused, then another": {[]string{`{"success":{"token":"tokGone"}}`, `{"success":{"token":"tokBob"}}`}, true},
 		"refused, then 502":     {[]string{`{"success":{"token":"tokGone"}}`, `{"success":{"token":"tokDown"}}`}, false},
 		// Anything else from tokeninfo is Google, or something in front
 		// of it, failing.
 		"tokeninfo 403": {[]string{`{"success":{"token":"tokProxy"}}`}, false},
-		"tokeninfo 404": {[]string{`{"success":{"token":"tokMoved"}}`}, false},
-		"tokeninfo 502": {[]string{`{"success":{"token":"tokDown"}}`}, false},
+		// A 400 is Google refusing only with error invalid_token in it.
+		"tokeninfo 400, not Google": {[]string{`{"success":{"token":"tokProxy4"}}`}, false},
+		"tokeninfo 404":             {[]string{`{"success":{"token":"tokMoved"}}`}, false},
+		"tokeninfo 502":             {[]string{`{"success":{"token":"tokDown"}}`}, false},
 	} {
 		v, g, sv := newScripted(t, vaultInfo, tc.answers...)
 		gr, err := v.refresh(ctx, g, alice, "", "")
@@ -215,44 +272,114 @@ func TestVaultCustodyEdges(t *testing.T) {
 		if errors.Is(err, errReauth) != tc.reauth {
 			t.Errorf("%s: %v, reauth=%v want %v", name, err, errors.Is(err, errReauth), tc.reauth)
 		}
+		// The error is logged: no token in it.
+		for tok := range maps.Keys(vaultInfo) {
+			if strings.Contains(err.Error(), tok) || strings.Contains(err.Error(), "tokGone") {
+				t.Errorf("%s: the error names a token: %v", name, err)
+			}
+		}
+	}
+	// A token Google still accepts is never force-refreshed: the vault
+	// answers that with consent. At refresh one with minRefreshTokenLife
+	// (75 s) left is used as it is; one with less is waited out, and the
+	// vault asked again, plainly.
+	for name, tc := range map[string]struct {
+		answers []string
+		want    string
+		forced  []string
+		waits   int
+	}{
+		"4 min token":                      {[]string{`{"success":{"token":"tokMid"}}`}, "tokMid", []string{""}, 0},
+		"100 s token":                      {[]string{`{"success":{"token":"tok100"}}`}, "tok100", []string{""}, 0},
+		"80 s token":                       {[]string{`{"success":{"token":"tok80"}}`}, "tok80", []string{""}, 0},
+		"30 s token, then a fresh one":     {[]string{tokShort, tokA}, "tokA", []string{"", ""}, 1},
+		"30 s token back expired, forced":  {[]string{tokShort, tokShort, tokA}, "tokA", []string{"", "", "tokShort"}, 1},
+		"30 s token, then refused, forced": {[]string{tokShort, `{"success":{"token":"tokGone"}}`, tokA}, "tokA", []string{"", "", "tokGone"}, 1},
+	} {
+		v, g, sv := newScripted(t, vaultInfo, tc.answers...)
+		gr, err := v.refresh(ctx, g, alice, "", "")
+		if err != nil || gr.AccessToken != tc.want {
+			t.Errorf("%s: %+v %v, want %s", name, gr, err, tc.want)
+		}
+		if !slices.Equal(sv.forced, tc.forced) || len(sv.waits) != tc.waits {
+			t.Errorf("%s: forced %q, waits %v; want forced %q, %d waits", name, sv.forced, sv.waits, tc.forced, tc.waits)
+		}
+		// The wait is the token's life (30 s) and expirySkew, never more
+		// than maxExpiryWait and expirySkew.
+		for _, d := range sv.waits {
+			if d < 29*time.Second || d > 30*time.Second+expirySkew {
+				t.Errorf("%s: waited %v for a 30 s token", name, d)
+			}
+		}
+	}
+	// Waited out and still valid (Google and the vault disagree on the
+	// time): a failure, and one wait only.
+	v, g, sv = newScripted(t, vaultInfo, tokShort, tokShort)
+	sv.expire = false
+	if gr, err := v.refresh(ctx, g, alice, "", ""); err == nil || errors.Is(err, errReauth) || len(sv.waits) != 1 || !slices.Equal(sv.forced, []string{"", ""}) {
+		t.Errorf("30 s token, still valid after the wait: %+v %v, waits %v forced %q", gr, err, sv.waits, sv.forced)
+	}
+	// The request ending during the (real) wait ends it: a failure, not a
+	// sign-out, and no second retrieve.
+	v, g, sv = newScripted(t, vaultInfo, tokShort)
+	v.sleeper = nil
+	cctx, cancel := context.WithTimeout(ctx, time.Second)
+	defer cancel()
+	start := time.Now()
+	if gr, err := v.refresh(cctx, g, alice, "", ""); !errors.Is(err, context.DeadlineExceeded) || errors.Is(err, errReauth) || len(sv.calls) != 1 || time.Since(start) > 10*time.Second {
+		t.Errorf("30 s token, request ended during the wait: %+v %v %v after %v", gr, err, sv.calls, time.Since(start))
+	}
+	// At sign-in the code is exchanged a moment later, so a token needs
+	// minSignInTokenLife (90 s). One with between that and maxExpiryWait
+	// (75 s) left is a failure, without a wait or a forced refresh; one
+	// with less is waited out.
+	for _, tok := range []string{"tokMid", "tok100"} {
+		v, g, sv = newScripted(t, vaultInfo, `{"success":{"token":"`+tok+`"}}`)
+		if gr, c, err := v.begin(ctx, g, alice, nil, ""); err != nil || c != nil || gr.AccessToken != tok || len(sv.calls) != 1 {
+			t.Errorf("begin, %s: %+v %+v %v %v", tok, gr, c, err, sv.calls)
+		}
+	}
+	v, g, sv = newScripted(t, vaultInfo, `{"success":{"token":"tok80"}}`)
+	if gr, c, err := v.begin(ctx, g, alice, nil, ""); err == nil || custodyError(err) != "server_error" || len(sv.calls) != 1 || len(sv.waits) != 0 {
+		t.Errorf("begin, tok80: %+v %+v %v, calls %v waits %v; want server_error at once", gr, c, err, sv.calls, sv.waits)
 	}
 	v, g, sv = newScripted(t, vaultInfo, tokShort, tokA)
-	if gr, err := v.refresh(ctx, g, alice, "", ""); err != nil || gr.AccessToken != "tokA" || len(sv.calls) != 2 {
-		t.Errorf("short token force-refreshed: %+v %v %v", gr, err, sv.calls)
+	if gr, c, err := v.begin(ctx, g, alice, nil, ""); err != nil || c != nil || gr.AccessToken != "tokA" || len(sv.waits) != 1 || !slices.Equal(sv.forced, []string{"", ""}) {
+		t.Errorf("begin, 30 s token: %+v %+v %v, waits %v forced %q", gr, c, err, sv.waits, sv.forced)
 	}
-	// The vault will not force-refresh a token that is still valid, and
-	// says so by asking for consent: not the grant gone. A forced refresh
-	// that brings no better token, short of a refusal, leaves the valid one
-	// in use if it has minLiveTokenLife left (tokMid, 4 min), and is a
-	// plain error if not (tokShort, 30 s).
-	for name, second := range map[string]string{
-		"consent":       consentAnswer,
-		"same token":    `{"success":{"token":"tokMid"}}`,
-		"pending":       `{"pending":{}}`,
-		"empty":         `{}`,
-		"outage":        "!503",
-		"refused":       `{"success":{"token":"tokGone"}}`,
-		"still short":   tokShort,
-		"tokeninfo 502": `{"success":{"token":"tokDown"}}`,
-	} {
-		v, g, sv := newScripted(t, vaultInfo, `{"success":{"token":"tokMid"}}`, second)
-		if gr, err := v.refresh(ctx, g, alice, "", ""); err != nil || gr.AccessToken != "tokMid" || len(sv.calls) != 2 {
-			t.Errorf("4 min token, then %s: %+v %v %v, want tokMid", name, gr, err, sv.calls)
-		}
-		v, g, _ = newScripted(t, vaultInfo, tokShort, second)
-		if gr, err := v.refresh(ctx, g, alice, "", ""); err == nil || errors.Is(err, errReauth) {
-			t.Errorf("30 s token, then %s: %+v %v, want a plain error", name, gr, err)
-		}
+	// The person is in the browser: a grant that cannot renew once the
+	// token expired is a consent detour.
+	v, g, _ = newScripted(t, vaultInfo, tokShort, consentAnswer)
+	if gr, c, err := v.begin(ctx, g, alice, nil, ""); err != nil || gr != nil || c == nil || c.URL != "https://consent.example/x" {
+		t.Errorf("begin, 30 s token, then consent: %+v %+v %v, want a consent detour", gr, c, err)
 	}
-	for name, second := range map[string]string{
-		"declined":        `{"consentRejected":{}}`,
-		"another account": `{"success":{"token":"tokBob"}}`,
-	} {
-		v, g, _ := newScripted(t, vaultInfo, `{"success":{"token":"tokMid"}}`, second)
-		if gr, err := v.refresh(ctx, g, alice, "", ""); !errors.Is(err, errReauth) {
-			t.Errorf("4 min token, then %s: %+v %v, want reauth: a refusal wins", name, gr, err)
-		}
+	// So is consent to renew the token that was waited out, which at
+	// refresh is not yet the grant gone.
+	v, g, _ = newScripted(t, vaultInfo, tokShort, tokShort, consentAnswer)
+	if gr, c, err := v.begin(ctx, g, alice, nil, ""); err != nil || gr != nil || c == nil || c.URL != "https://consent.example/x" {
+		t.Errorf("begin, 30 s token back expired, then consent: %+v %+v %v, want a consent detour", gr, c, err)
 	}
+	v, g, _ = newScripted(t, vaultInfo, "", tokShort, tokShort, consentAnswer)
+	if _, err := v.finish(ctx, g, alice, c1, q("user_id_validation_state", "s"), ""); err == nil || errors.Is(err, errReauth) {
+		t.Errorf("finish, 30 s token back expired, then consent: %v, want a plain error", err)
+	}
+	// At refresh it is server_error once; the next refresh does not wait,
+	// forces the expired token, and consent then is the grant gone.
+	v, g, sv = newScripted(t, vaultInfo, tokShort, tokShort, consentAnswer)
+	if _, err := v.refresh(ctx, g, alice, "", ""); err == nil || errors.Is(err, errReauth) || custodyError(err) != "server_error" {
+		t.Errorf("refresh, 30 s token back expired, then consent: %v, want server_error", err)
+	}
+	sv.mu.Lock()
+	sv.answers = []string{tokShort, consentAnswer}
+	sv.mu.Unlock()
+	if _, err := v.refresh(ctx, g, alice, "", ""); !errors.Is(err, errReauth) {
+		t.Errorf("the next refresh, expired token forced, then consent: %v, want reauth", err)
+	}
+	sv.mu.Lock()
+	if len(sv.waits) != 1 || !slices.Equal(sv.forced, []string{"", "", "tokShort", "", "tokShort"}) {
+		t.Errorf("waits %v, forced %q; want one wait, and the expired token forced by both refreshes", sv.waits, sv.forced)
+	}
+	sv.mu.Unlock()
 	v, g, sv = newScripted(t, vaultInfo, `{"success":{"token":"tokGone"}}`, tokA)
 	if gr, err := v.refresh(ctx, g, alice, "", ""); err != nil || gr.AccessToken != "tokA" || len(sv.calls) != 2 {
 		t.Errorf("token Google refused force-refreshed: %+v %v %v", gr, err, sv.calls)
@@ -376,37 +503,167 @@ func overrideVault(e *testEnv, answers ...string) {
 	vc.Client = &http.Client{Transport: o}
 }
 
-// A nearly spent vault token whose forced refresh the vault declines (by
-// asking for consent) at sign-in: with 4 minutes left it is used, and the
-// code exchanges for an access token; with 30 seconds left the sign-in
-// fails at the authorize redirect, before a code that could never be
-// exchanged is issued. Neither is access_denied.
+// A nearly spent vault token at sign-in is never force-refreshed (the
+// real vault, like the fake, would ask for consent). With 4 minutes left
+// it is used, and the access token stops a minute before it; with 100
+// seconds left too. With 80 seconds left (under minSignInTokenLife, over
+// maxExpiryWait) the sign-in fails at the authorize redirect, before a
+// code that might never exchange is issued: server_error, not
+// access_denied. With 30 seconds left it is
+// waited out, and the vault's next token, a fresh one, goes in the code.
+// The nearly spent token reaches no log.
 func TestVaultNearlySpentTokenAtSignIn(t *testing.T) {
 	t.Parallel()
 	for _, c := range []struct {
-		life int
-		ok   bool
-	}{{240, true}, {30, false}} {
+		life  int
+		want  string // "code" (with the short token), "fresh" (a code with a fresh one) or an error
+		waits int
+	}{{240, "code", 0}, {100, "code", 0}, {80, "server_error", 0}, {30, "fresh", 1}} {
 		e := newTestEnv(t, false, nil)
+		e.signIn(newBrowser(t)) // the vault holds alice's grant
 		e.google.mu.Lock()
 		tok := e.google.mint(alice, ScopeOpenID+" "+ScopeEmail+" "+ScopeCloudPlatform, c.life)
 		e.google.mu.Unlock()
-		overrideVault(e, `{"success":{"token":"`+tok+`"}}`, consentAnswer)
+		overrideVault(e, `{"success":{"token":"`+tok+`"}}`)
 		id, v := e.register(), rand.Text()+rand.Text()
 		loc, _ := newBrowser(t).visit(e.authorizeURL(id, v, nil))
-		if !c.ok {
-			if loc == nil || loc.Query().Get("error") != "server_error" {
-				t.Errorf("%d s left, refresh declined: %v, want server_error at the redirect", c.life, loc)
+		e.vault.mu.Lock()
+		forced, waits := e.vault.forced, len(e.vault.waits)
+		e.vault.mu.Unlock()
+		if forced != 0 || waits != c.waits {
+			t.Errorf("%d s left: %d forced refreshes, %d waits; want none forced, %d waits", c.life, forced, waits, c.waits)
+		}
+		if strings.Contains(e.log.String(), tok) {
+			t.Errorf("%d s left: the token reached the log", c.life)
+		}
+		if c.want != "code" && c.want != "fresh" {
+			if loc == nil || loc.Query().Get("error") != c.want {
+				t.Errorf("%d s left: %v, want %s at the redirect", c.life, loc, c.want)
 			}
 			continue
 		}
 		if loc == nil || loc.Query().Get("code") == "" {
-			t.Fatalf("%d s left, refresh declined: %v, want a code", c.life, loc)
+			t.Fatalf("%d s left: %v, want a code", c.life, loc)
 		}
-		if r := e.token(exchangeForm(id, loc.Query().Get("code"), v), "", ""); r.status != http.StatusOK || r.Expires > int64(c.life-60) {
-			t.Errorf("%d s left: exchange %+v, want an access token that stops a minute before the Google token", c.life, r)
+		r := e.token(exchangeForm(id, loc.Query().Get("code"), v), "", "")
+		switch {
+		case r.status != http.StatusOK:
+			t.Errorf("%d s left: exchange %+v", c.life, r)
+		case c.want == "code" && r.Expires > int64(c.life-60):
+			t.Errorf("%d s left: expires_in %d, want an access token that stops a minute before the Google token", c.life, r.Expires)
+		case c.want == "fresh" && r.Expires < int64((AccessTTL-time.Minute).Seconds()):
+			t.Errorf("%d s left: expires_in %d, want a fresh Google token's", c.life, r.Expires)
 		}
 	}
+}
+
+// An active client's refresh lands when the Google token has a minute
+// left: its access token stopped then. The vault would answer a forced
+// refresh with consent, so the token is waited out (about a minute, here
+// no time at all) and the vault asked again, plainly, which renews it:
+// the refresh succeeds with a fresh hour, and nothing is forced. A refresh
+// with 4 minutes left uses the token as it is, forcing nothing. Neither
+// signs the person out, and neither token reaches the log.
+func TestVaultRefreshAcrossGoogleExpiry(t *testing.T) {
+	t.Parallel()
+	e := newTestEnv(t, false, nil)
+	id, first := e.signIn(newBrowser(t))
+	e.google.mu.Lock()
+	mid := e.google.mint(alice, ScopeOpenID+" "+ScopeEmail+" "+ScopeCloudPlatform, 240)
+	last := e.google.mint(alice, ScopeOpenID+" "+ScopeEmail+" "+ScopeCloudPlatform, 60)
+	e.google.mu.Unlock()
+
+	overrideVault(e, `{"success":{"token":"`+mid+`"}}`)
+	second := e.token(refreshForm(id, first.Refresh), "", "")
+	if second.status != http.StatusOK || second.Expires > 180 || second.Expires < 170 {
+		t.Fatalf("refresh with 4 minutes left: %+v, want an access token of about 3 minutes", second)
+	}
+
+	overrideVault(e, `{"success":{"token":"`+last+`"}}`)
+	third := e.token(refreshForm(id, second.Refresh), "", "")
+	if third.status != http.StatusOK || third.Expires < int64((AccessTTL-time.Minute).Seconds()) {
+		t.Fatalf("refresh with a minute left: %+v, want a fresh Google token's access token", third)
+	}
+	e.vault.mu.Lock()
+	forced, waits := e.vault.forced, e.vault.waits
+	e.vault.mu.Unlock()
+	if forced != 0 || len(waits) != 1 || waits[0] < 59*time.Second || waits[0] > time.Minute+expirySkew {
+		t.Errorf("forced %d, waits %v; want none forced and one wait of about a minute", forced, waits)
+	}
+	if code, body, _ := e.call(third.Access); code != http.StatusOK || strings.Contains(body, last) || strings.Contains(body, mid) {
+		t.Errorf("call with the renewed access token: %d %q", code, body)
+	}
+	if l := e.log.String(); strings.Contains(l, mid) || strings.Contains(l, last) {
+		t.Error("a vault token reached the log")
+	}
+}
+
+// A client that gives up during the wait (its timeout, or a front end's,
+// is shorter) cancels the request: the refresh fails, the family is
+// rotated back, and the client's retry with the same refresh token works
+// rather than being taken for a replay that signs the person out.
+func TestVaultClientGivesUpDuringTheWait(t *testing.T) {
+	t.Parallel()
+	used := &unrotateSignal{ReplayCache: NewMemoryReplayCache(), unrotated: make(chan struct{}, 1)}
+	e := newTestEnv(t, false, func(c *Config) { c.Replay = used })
+	id, first := e.signIn(newBrowser(t))
+	e.google.mu.Lock()
+	last := e.google.mint(alice, ScopeOpenID+" "+ScopeEmail+" "+ScopeCloudPlatform, 60)
+	e.google.mu.Unlock()
+	overrideVault(e, `{"success":{"token":"`+last+`"}}`)
+	vc := e.as.cfg.Custody.(*VaultCustody)
+	waiting := make(chan struct{})
+	vc.sleeper = &sleeper{func(ctx context.Context, _ time.Duration) error {
+		close(waiting)
+		<-ctx.Done()
+		return ctx.Err()
+	}}
+	ctx, cancel := context.WithCancel(context.Background())
+	req, _ := http.NewRequestWithContext(ctx, http.MethodPost, e.srv.URL+"/token", strings.NewReader(refreshForm(id, first.Refresh).Encode()))
+	req.Header.Set("Content-Type", "application/x-www-form-urlencoded")
+	done := make(chan error, 1)
+	go func() {
+		resp, err := hc.Do(req)
+		if err == nil {
+			_ = resp.Body.Close()
+		}
+		done <- err
+	}()
+	select {
+	case <-waiting:
+	case err := <-done:
+		cancel()
+		t.Fatalf("the refresh answered (%v) without waiting out the nearly spent token", err)
+	}
+	cancel()
+	if err := <-done; err == nil {
+		t.Fatal("the abandoned refresh answered")
+	}
+	// The server notices the client went away and gives the token back.
+	select {
+	case <-used.unrotated:
+	case <-time.After(10 * time.Second):
+		t.Fatal("the server never gave the refresh token back")
+	}
+	vc.sleeper = &sleeper{e.vault.sleep}
+	if r := e.token(refreshForm(id, first.Refresh), "", ""); r.status != http.StatusOK {
+		t.Errorf("retry after giving up during the wait: %+v, want the refresh token given back", r)
+	}
+}
+
+// unrotateSignal reports each Unrotate on unrotated.
+type unrotateSignal struct {
+	ReplayCache
+	unrotated chan struct{}
+}
+
+func (u *unrotateSignal) Unrotate(ctx context.Context, family string, gen uint64) error {
+	err := u.ReplayCache.Unrotate(ctx, family, gen)
+	select {
+	case u.unrotated <- struct{}{}:
+	default:
+	}
+	return err
 }
 
 // A busy vault ("pending") at refresh is the vault failing, not refusing:

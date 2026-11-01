@@ -300,9 +300,9 @@ type tokenInfo struct {
 }
 
 // errGoogleToken is Google's tokeninfo refusing an access token (400
-// invalid_token, its only verdict status): expired, revoked or never
-// valid. Any other non-200 answer is Google, or something in front of it,
-// failing.
+// with error invalid_token, its only verdict): expired, revoked or never
+// valid. Any other non-200 answer, a 400 without that error included, is
+// Google, or something in front of it, failing.
 var errGoogleToken = errors.New("google tokeninfo: the access token is invalid")
 
 // tokenInfo asks Google whose an access token is and when it really
@@ -322,7 +322,15 @@ func (g *GoogleClient) tokenInfo(ctx context.Context, hc *http.Client, accessTok
 	switch resp.StatusCode {
 	case http.StatusOK:
 	case http.StatusBadRequest:
-		return nil, errGoogleToken
+		// Google's verdict carries error invalid_token; a 400 without it
+		// (an egress proxy's, say) is not Google refusing.
+		var e struct {
+			Error string `json:"error"`
+		}
+		if json.NewDecoder(io.LimitReader(resp.Body, 1<<16)).Decode(&e) == nil && e.Error == "invalid_token" {
+			return nil, errGoogleToken
+		}
+		return nil, fmt.Errorf("google tokeninfo: HTTP %d", resp.StatusCode)
 	default:
 		return nil, fmt.Errorf("google tokeninfo: HTTP %d", resp.StatusCode)
 	}
