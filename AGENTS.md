@@ -113,7 +113,7 @@ force-push `main`. Full contributor flow + DCO in
 
 ## Current state
 
-**v0.2.0: Path A and Path B.** v0.1.0 shipped Path A: `googletoken` (the
+**v0.3.0: Path A and Path B.** v0.1.0 shipped Path A: `googletoken` (the
 verifier and a purser authenticator, moved from supercargo), `allow`,
 `httpauth` (the Protector: purser's enforced middleware, the token source,
 RFC 9728 metadata) and `mcpauth` (SDK session binding and per-call
@@ -123,7 +123,9 @@ envelopes; Secret Manager keys in `seal/secretmanager`), `authserver`
 (the OAuth 2.1 authorization server: DCR, CIMD, static clients, PKCE,
 resource indicators, client credentials, vault and sealed custody,
 refresh-token families) and both token kinds in one `httpauth.Protector`
-and `mcpauth`. `allow`'s group checker, `seal` and `authserver` are taken
+and `mcpauth`. v0.3.0 (purser v0.3.0) answers outages with 503, not 401,
+and closes the CIMD filter to zoned IPv6; k8s-lookout runs it for both
+paths. `allow`'s group checker, `seal` and `authserver` are taken
 from kode-gopher at `8b53617`, which will not import steward: port fixes
 by hand in both directions (DESIGN.md lists the ones made here).
 supercargo keeps its own `googletoken` copy and is not moving to steward,

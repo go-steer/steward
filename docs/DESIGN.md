@@ -25,7 +25,7 @@ one caller type however the caller arrived.
 
 | Consumer | Uses | Status |
 |---|---|---|
-| go-steer/k8s-lookout | Path A: Gemini Enterprise users read clusters as themselves (k8s-lookout#699); Path B: generic MCP clients sign in through steward's authorization server (k8s-lookout#702) | Path A on v0.1.0; Path B on v0.2.0 |
+| go-steer/k8s-lookout | Path A: Gemini Enterprise users read clusters as themselves (k8s-lookout#699); Path B: generic MCP clients sign in through steward's authorization server (k8s-lookout#702) | Paths A and B on v0.3.0 (2026-11-01) |
 | go-steer/supercargo | Path A: the source of `googletoken`; adopting steward would replace its `internal/googleauth` | not planned (2026-10-20): supercargo keeps its own `internal/googleauth`; port fixes by hand |
 
 ## Path A — the client holds the user's token
@@ -826,37 +826,48 @@ dedicated source would be a purser addition.
 
 **Differences from kode-gopher**, besides the generalizations (scopes,
 resource, Google scopes, optional workload service account, `Admitter`,
-pluggable replay cache and keys, slog), most from this port's adversarial
-review and worth porting back: refresh-token families with reuse
-detection instead of one replay entry per refresh, the reuse grace
-that spares a concurrent refresh's family, and rotation IDs so a refresh
-gives back only its own rotation; refresh re-checks the
-grant's scopes against the configuration; a narrowing refresh does not
-narrow the grant; rotating a workload's secret revokes its tokens; an
-email change since sign-in forces a new sign-in; the refresh token's
-audience is checked against the configured resource; more than one
-`resource` parameter is refused; an authorization code is given back if
-sealing the tokens fails; custody failures that are Google failing are
-`server_error`, not `access_denied`, including a `pending` or empty vault
-answer (a sign-out before); a vault token Google still accepts is never
-force-refreshed (kode-gopher forces one with under 5 minutes left): it is
-used down to 75 seconds at refresh (90 at sign-in), and one
-with less is waited out and retrieved again, before the refresh token's
-family is rotated (Vault renewal, above); a
-vault token tokeninfo refuses is force-refreshed once, then a consent
-detour at sign-in or a refusal, rather than `server_error`;
-client-resolution
-errors (CIMD contents, dial errors) are not echoed; error descriptions
-keep to RFC 6749's character set; the SSRF filter also refuses NAT64, 6to4, Teredo
-and other special-purpose ranges; flow cookies are `__Host-` where
-possible and `__Secure-` on https otherwise; client secrets are compared
-by digest; a static client's redirect URIs are validated at load and its
-slices copied; Google's endpoints must be https; the keys being
-unavailable is `server_error`, never `invalid_grant`; the consent page's
-text is the service's (`ServiceName`); and a client's name there is
-cleaned and kept apart from its client ID and redirect host (see Client
-names above). Scopes are granted in the configuration's order, so a grant
-reads the same however the client ordered its request.
+pluggable replay cache and keys, slog, the consent page's text being the
+service's `ServiceName`). Most came from this port's adversarial review,
+and most of those have since been ported to kode-gopher (state as of
+kode-gopher `66fbee8`, which is v0.4.0 plus docs):
+
+- **Not ported:** the reuse grace that spares a concurrent refresh's
+  family (steward#18); flow cookies `__Secure-` on an https issuer with a
+  path (kode-gopher sets every cookie on `/`, so `__Host-` always fits).
+- **Port in progress:** rotation IDs, so a refresh gives back only its
+  own rotation (steward#22); a vault token Google still accepts is never
+  force-refreshed: it is used down to 75 seconds at refresh (90 at
+  sign-in), and one with less is waited out and retrieved again, before
+  the refresh token's family is rotated (steward#23, Vault renewal,
+  above).
+  kode-gopher#56 still forces one with under 5 minutes left, and keeps
+  it if the vault then asks for consent and it has 3 minutes left.
+- **Not needed there** (one fixed scope, a keyring loaded once at
+  startup): refresh re-checks the grant's scopes against the
+  configuration; a narrowing refresh does not narrow the grant; the keys
+  being unavailable is `server_error`, never `invalid_grant`; scopes are
+  granted in the configuration's order, so a grant reads the same however
+  the client ordered its request.
+- **Ported:** more than one `resource` parameter is refused, custody
+  failures that are Google failing are `server_error` rather than
+  `access_denied`, and error descriptions keep to RFC 6749's character set
+  (kode-gopher#51); refresh-token families with reuse detection instead
+  of one replay entry per refresh, rotating a workload's secret revokes
+  its tokens, an email change since sign-in forces a new sign-in, the
+  refresh token's audience is checked against the configured resource,
+  and an authorization code is given back if sealing the tokens fails
+  (kode-gopher#52); client-resolution errors (CIMD contents, dial errors)
+  are not echoed, the SSRF filter also refuses NAT64, 6to4, Teredo, zoned
+  and other special-purpose addresses, client secrets are compared by
+  digest, a static client's redirect URIs are validated at load and its
+  slices copied, and Google's endpoints must be https (kode-gopher#53); a
+  cached group name is looked up again on a 403 as well as a 404
+  (kode-gopher#54); a client's name is cleaned and kept apart from its
+  client ID and redirect host on the consent page (kode-gopher#55, see
+  Client names above); a `pending` or empty vault answer is
+  `server_error` (a sign-out before), and a vault token tokeninfo refuses
+  is force-refreshed once, then a consent detour at sign-in or a refusal,
+  rather than `server_error` (kode-gopher#56).
 
 **Ported from kode-gopher since `8b53617`.** `fb8ea5e` (kode-gopher#48):
 the browser-binding cookie is kept across sign-ins started in one browser,
@@ -872,9 +883,24 @@ instead of a damaged-link page. kode-gopher's known limitation holds here
 too: the vault's consent leg parks the flow in one `steward_consent`
 cookie, so two sign-ins that both reach the vault's own consent screen
 still collide (the later one replaces the earlier one's); finish one
-first. `2f33327` (kode-gopher#56), in part: a tokeninfo 400 is Google
-refusing only with `error` `invalid_token` in its body; any other 400 (an
-egress proxy's) is `server_error`.
+first. `6cacac1` (kode-gopher#54), tests only: a retry that reads a group
+name another check has just cached costs no lookup (the `retried`
+guard), and a nested group's 403 or 404 leaves the root's cached name
+alone. `7e11b72` (kode-gopher#55), tests only: a CIMD client's resolved
+name is clean, and the consent page cleans a name whatever reaches it.
+steward had the code right; nothing tested it. `2f33327` (kode-gopher#56),
+in part: a tokeninfo 400 is Google refusing only with `error`
+`invalid_token` in its body; any other 400 (an egress proxy's) is
+`server_error`. kode-gopher has no Path A; steward applies the same rule
+in `googletoken`, where such a 400 is `ErrUnavailable` (Verification,
+above).
+
+The reviews of those ports also found bugs that steward fixed first:
+zoned IPv6 addresses passing the SSRF filter (steward#12, from
+kode-gopher#53), a recreated group's 403 (steward#16, from
+kode-gopher#50), bidi characters in client names (steward#17, from
+kode-gopher#53) and a busy vault signing people out (steward#20, from
+kode-gopher#51).
 
 ### Both paths on one resource (`httpauth`, `mcpauth`)
 
