@@ -13,6 +13,14 @@ exported API" in [`CONTRIBUTING.md`](./CONTRIBUTING.md)).
 - `authserver.Config.RefreshReuseGrace`, `authserver.GraceReplayCache`
   (`RotateGrace`), `authserver.RotateResult` and its constants, and
   `MemoryReplayCache.RotateGrace`: the refresh-token reuse grace below.
+- `authserver.RotationIDReplayCache` (`RotateWithID`, `UnrotateWithID`)
+  and `MemoryReplayCache.RotateWithID` and `UnrotateWithID`: rotations
+  that carry an ID, so a refresh gives back only its own rotation (see
+  Fixed). `RotateWithID` is idempotent for its own ID, so a cache client
+  that retries a rotation after a lost reply does not sign the person
+  out. A shared `ReplayCache` should implement it; one that does not
+  keeps the old, generation-only `Unrotate`, and the fix holds only once
+  every replica sharing a cache runs this version.
 
 ### Changed
 
@@ -34,6 +42,10 @@ exported API" in [`CONTRIBUTING.md`](./CONTRIBUTING.md)).
   keeps revoking on every reuse. `MemoryReplayCache` implements it, so a
   wrapper that embeds it and overrides `Rotate` must now override
   `RotateGrace` too, or the server skips the override.
+- **A wrapper that embeds `*authserver.MemoryReplayCache` and overrides
+  `Rotate`, `RotateGrace` or `Unrotate` must now override `RotateWithID`
+  and `UnrotateWithID` too.** The server prefers them when the cache has
+  them, so it calls the embedded ones and skips the overrides otherwise.
 
 ### Security
 
@@ -64,6 +76,20 @@ exported API" in [`CONTRIBUTING.md`](./CONTRIBUTING.md)).
 
 ### Fixed
 
+- **A failed refresh can no longer give back a concurrent refresh's
+  rotation and mint a second branch of the family.** After a transient
+  failure (including a replay-cache error whose outcome is unknown),
+  `authserver` gives the refresh's rotation back with `Unrotate`, which is
+  conditional only on the generation. With a cache shared between
+  replicas, a request whose `Rotate` failed without applying, while
+  another refresh with the same token applied, moved the family back from
+  that refresh's rotation; the client's retry then rotated it again, so a
+  rotated refresh token yielded tokens and two refresh tokens of the next
+  generation were live, defeating reuse detection for that family. With a
+  cache that implements the new `RotationIDReplayCache` (the in-memory one
+  does), each refresh rotates under a random ID and gives back only the
+  rotation with that ID: the retry is then refused as a replay. Shared
+  caches need to implement it to get the fix.
 - **A recreated allow-listed group no longer locks its members out for up
   to an hour.** `CloudIdentityGroups` caches a group's resource name for
   an hour, and a group deleted and recreated in that hour has a new one.

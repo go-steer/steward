@@ -53,6 +53,23 @@ func (c *ctxReplay) Unrotate(ctx context.Context, fam string, gen uint64) error 
 	return c.MemoryReplayCache.Unrotate(ctx, fam, gen)
 }
 
+// UnrotateWithID and RotateWithID override the embedded cache's too, as
+// RotationIDReplayCache tells a wrapper to, or the server would skip the
+// overrides.
+func (c *ctxReplay) UnrotateWithID(ctx context.Context, fam string, gen uint64, rotation string) error {
+	if err := ctx.Err(); err != nil {
+		return err
+	}
+	c.mu.Lock()
+	c.unrotated++
+	c.mu.Unlock()
+	return c.MemoryReplayCache.UnrotateWithID(ctx, fam, gen, rotation)
+}
+
+func (c *ctxReplay) RotateWithID(ctx context.Context, fam string, gen uint64, exp, graceUntil time.Time, rotation string) (RotateResult, error) {
+	return c.failIfAsked(c.MemoryReplayCache.RotateWithID(ctx, fam, gen, exp, graceUntil, rotation))
+}
+
 func (c *ctxReplay) Release(ctx context.Context, id string) error {
 	if err := ctx.Err(); err != nil {
 		return err
@@ -68,7 +85,12 @@ func (c *ctxReplay) Rotate(ctx context.Context, fam string, gen uint64, exp time
 // RotateGrace overrides the embedded cache's too, as GraceReplayCache
 // tells a wrapper to, or the server would skip the override.
 func (c *ctxReplay) RotateGrace(ctx context.Context, fam string, gen uint64, exp, graceUntil time.Time) (RotateResult, error) {
-	r, err := c.MemoryReplayCache.RotateGrace(ctx, fam, gen, exp, graceUntil)
+	return c.failIfAsked(c.MemoryReplayCache.RotateGrace(ctx, fam, gen, exp, graceUntil))
+}
+
+// failIfAsked turns an applied rotation's answer into an error, once,
+// when failAfterApply is set.
+func (c *ctxReplay) failIfAsked(r RotateResult, err error) (RotateResult, error) {
 	c.mu.Lock()
 	defer c.mu.Unlock()
 	if c.failAfterApply {
