@@ -1,6 +1,6 @@
 module github.com/go-steer/steward
 
-go 1.26.9
+go 1.26.10
 
 require (
 	github.com/go-steer/purser v0.3.0
