@@ -113,7 +113,7 @@ force-push `main`. Full contributor flow + DCO in
 
 ## Current state
 
-**v0.3.0: Path A and Path B.** v0.1.0 shipped Path A: `googletoken` (the
+**v0.4.0: Path A and Path B.** v0.1.0 shipped Path A: `googletoken` (the
 verifier and a purser authenticator, moved from supercargo), `allow`,
 `httpauth` (the Protector: purser's enforced middleware, the token source,
 RFC 9728 metadata) and `mcpauth` (SDK session binding and per-call
@@ -125,7 +125,10 @@ resource indicators, client credentials, vault and sealed custody,
 refresh-token families) and both token kinds in one `httpauth.Protector`
 and `mcpauth`. v0.3.0 (purser v0.3.0) answers outages with 503, not 401,
 and closes the CIMD filter to zoned IPv6; k8s-lookout runs it for both
-paths. `allow`'s group checker, `seal` and `authserver` are taken
+paths. v0.4.0 fixes vault custody's hourly re-sign-in (no forced refresh
+of a token Google accepts; a nearly spent one is waited out before the
+family rotates), adds rotation IDs for shared replay caches and an
+optional reuse grace, and treats only Google's own verdict as a refusal. `allow`'s group checker, `seal` and `authserver` are taken
 from kode-gopher at `8b53617`, which will not import steward: port fixes
 by hand in both directions (DESIGN.md lists the ones made here).
 supercargo keeps its own `googletoken` copy and is not moving to steward,
