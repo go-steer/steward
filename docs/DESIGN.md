@@ -68,15 +68,20 @@ Bounds, so that garbage tokens cannot turn into a flood of calls to Google:
   turned away as unavailable (load-shedding, not a verdict).
 - At most 1024 cache entries.
 - Only an endpoint's own verdict on the token is Google refusing
-  (`ErrInvalid`, cached, a 401): tokeninfo's 400 `invalid_token` and
-  userinfo's 401, the statuses each answers a bad token with (checked
-  against Google, 2026-10-20). Everything else is `ErrUnavailable` and
-  **never** cached (a 503): no answer, 429, 5xx, any other status (an
-  egress proxy's 403 or 407, a 404 from a moved endpoint, which say
-  nothing about the token; steward#14), a body cut short (the client went
-  away, a timeout fired, the connection dropped), and a 200 that does not
-  parse. Caching a half-read answer as a refusal would let one
-  disconnecting client lock a person's valid token out for 30 s.
+  (`ErrInvalid`, cached, a 401): tokeninfo's 400 with a JSON body whose
+  `error` is `invalid_token`, and userinfo's 401, what each answers a bad
+  token with (checked against Google, 2026-10-20 and 2026-11-01: every
+  bad, expired or missing token got exactly that). userinfo's body says
+  only `invalid_request`, too generic to check, so its status decides; a
+  proxy asking for credentials sends 407. Everything else is
+  `ErrUnavailable` and **never** cached (a 503): no answer, 429, 5xx, any
+  other status (an egress proxy's 403 or 407, a 404 from a moved
+  endpoint, which say nothing about the token; steward#14), a tokeninfo
+  400 without `invalid_token` (an egress proxy's, an HTML page; the rule
+  kode-gopher#56 applies to its vault's tokeninfo check), a body cut short
+  (the client went away, a timeout fired, the connection dropped), and a
+  200 that does not parse. Caching a half-read answer as a refusal would
+  let one disconnecting client lock a person's valid token out for 30 s.
 - A lookup that failed because the client went away (its context
   cancelled) is logged at Debug, not Warn, by `Config.Logger` and the
   Authenticator alike, as purser's middleware does: it is no outage. A

@@ -250,7 +250,7 @@ func TestLookupLimit(t *testing.T) {
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
 		inflight.Add(1)
 		<-release
-		http.Error(w, "{}", http.StatusBadRequest)
+		http.Error(w, `{"error":"invalid_token","error_description":"Invalid Value"}`, http.StatusBadRequest)
 	}))
 	defer srv.Close()
 	v, err := New(Config{ClientIDs: []string{clientID}, TokenInfoURL: srv.URL, UserInfoURL: srv.URL})

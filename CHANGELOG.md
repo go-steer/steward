@@ -188,6 +188,16 @@ exported API" in [`CONTRIBUTING.md`](./CONTRIBUTING.md)).
   sign the person out. A 400 now needs `error` `invalid_token` in its JSON
   body (as Google sends it, and as kode-gopher already checks); any other
   is `server_error`.
+- **`googletoken`: an egress proxy's 400 no longer reads as a bad token.**
+  The Verifier took any 400 from tokeninfo for Google refusing the token:
+  `ErrInvalid`, cached for 30 s and a 401 behind purser, so a proxy's or
+  gateway's 400 sent Path A clients to sign in again. A 400 is now
+  `ErrInvalid` only with `error` `invalid_token` in its JSON body, which
+  Google sends for every token it refuses; any other 400 (an HTML page,
+  another error code, a body cut short) is `ErrUnavailable`: never cached,
+  and a 503 with `Retry-After` behind purser. userinfo's 401 is unchanged.
+  This extends to Path A the rule kode-gopher `2f33327` applies to its
+  vault's tokeninfo check (and `authserver` already does).
 
 ## [0.3.0] - 2026-10-20
 

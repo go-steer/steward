@@ -86,13 +86,25 @@ const (
 	maxBody = 64 << 10
 )
 
-// The statuses Google's endpoints answer a token they reject with: the
-// only non-200 answers that are verdicts on the token. tokeninfo answers
-// 400 {"error":"invalid_token"}, userinfo 401 (both checked against Google
-// with a bogus token, 2026-10-20).
-const (
-	tokenInfoRefused = http.StatusBadRequest
-	userInfoRefused  = http.StatusUnauthorized
+// refusal is how one of Google's endpoints answers a token it rejects:
+// the only non-200 answer that is a verdict on the token. status is the
+// HTTP status; errorCode, when set, is the "error" value the JSON body
+// must carry too, so that a status something in front of Google sends as
+// well (an egress proxy's 400) is not taken for a verdict.
+type refusal struct {
+	status    int
+	errorCode string
+}
+
+// Google's refusals. tokeninfo answers 400 {"error":"invalid_token"} for
+// every bad, expired or missing token. userinfo answers 401
+// {"error":"invalid_request"}, a code too generic to tell Google from
+// anything else, so its status alone decides; a proxy asking for
+// credentials sends 407, not 401. Both checked against Google with bogus
+// tokens, 2026-10-20 and 2026-11-01.
+var (
+	tokenInfoRefused = refusal{status: http.StatusBadRequest, errorCode: "invalid_token"}
+	userInfoRefused  = refusal{status: http.StatusUnauthorized}
 )
 
 // ErrInvalid is a token Google refused, or one that fails a check: not
@@ -103,7 +115,7 @@ var ErrInvalid = fmt.Errorf("googletoken: invalid token: %w", purser.ErrUnauthen
 
 // ErrUnavailable is Google failing to answer (no response, 429, 5xx, or
 // any other answer that is not Google's verdict on the token, such as an
-// egress proxy's 403 or 407, or a 404 from a moved endpoint) or this
+// egress proxy's 400, 403 or 407, or a 404 from a moved endpoint) or this
 // Verifier shedding load (MaxLookups in flight). It is never cached.
 // It wraps purser.ErrUnavailable and not purser.ErrUnauthenticated: the
 // token may be fine and a retry may succeed, so purser's enforced
@@ -398,15 +410,17 @@ func (v *Verifier) lookup(ctx context.Context, token string, now time.Time) (Ide
 
 // fetch sends req and decodes its JSON answer into out.
 //
-// Only refused, the status the endpoint answers a token it rejects with,
-// is Google refusing (ErrInvalid, which Verify caches). Everything else
-// is ErrUnavailable, never cached: no answer, 429, 5xx, any other status
-// (an egress proxy's 403 or 407, a 404 from a moved endpoint: nothing
-// Google said about the token), a body cut short (the client went away,
-// the timeout fired, the connection dropped) and a 200 whose body does
-// not parse. Treating any of those as a refusal would lock a person's
-// valid token out for RefusedTTL and send their client to sign in again.
-func (v *Verifier) fetch(req *http.Request, what string, refused int, out any) error {
+// Only refused, the answer the endpoint gives a token it rejects, is
+// Google refusing (ErrInvalid, which Verify caches). Everything else is
+// ErrUnavailable, never cached: no answer, 429, 5xx, any other status (an
+// egress proxy's 403 or 407, a 404 from a moved endpoint: nothing Google
+// said about the token), refused's status without its error code (an
+// egress proxy's 400, an HTML error page, a body cut short), a 200 body
+// cut short (the client went away, the timeout fired, the connection
+// dropped) and a 200 whose body does not parse. Treating any of those as
+// a refusal would lock a person's valid token out for RefusedTTL and send
+// their client to sign in again.
+func (v *Verifier) fetch(req *http.Request, what string, refused refusal, out any) error {
 	resp, err := v.hc.Do(req)
 	if err != nil {
 		// A *url.Error names the URL, never the body or headers, so the
@@ -416,8 +430,10 @@ func (v *Verifier) fetch(req *http.Request, what string, refused int, out any) e
 	defer func() { _ = resp.Body.Close() }()
 	switch resp.StatusCode {
 	case http.StatusOK:
-	case refused:
-		return ErrInvalid // an expired, revoked or malformed token
+	case refused.status:
+		if refused.errorCode == "" {
+			return ErrInvalid // an expired, revoked or malformed token
+		}
 	default:
 		return fmt.Errorf("%w: %s: HTTP %d", ErrUnavailable, what, resp.StatusCode)
 	}
@@ -426,12 +442,32 @@ func (v *Verifier) fetch(req *http.Request, what string, refused int, out any) e
 		err = req.Context().Err()
 	}
 	if err != nil {
-		return fmt.Errorf("%w: %s: reading the answer: %w", ErrUnavailable, what, err)
+		return fmt.Errorf("%w: %s: reading the HTTP %d answer: %w", ErrUnavailable, what, resp.StatusCode, err)
+	}
+	if resp.StatusCode != http.StatusOK {
+		if isRefusal(body, refused.errorCode) {
+			return ErrInvalid // an expired, revoked or malformed token
+		}
+		// Not Google's verdict. The body is whoever sent it, and stays
+		// out of the error.
+		return fmt.Errorf("%w: %s: HTTP %d without error %s", ErrUnavailable, what, resp.StatusCode, refused.errorCode)
 	}
 	if err := json.Unmarshal(body, out); err != nil {
 		return fmt.Errorf("%w: %s: unreadable answer: %w", ErrUnavailable, what, err)
 	}
 	return nil
+}
+
+// isRefusal reports whether body is a JSON object whose "error" member
+// (that key exactly, unlike encoding/json's case-insensitive field
+// matching) is the string code.
+func isRefusal(body []byte, code string) bool {
+	var m map[string]json.RawMessage
+	if json.Unmarshal(body, &m) != nil {
+		return false
+	}
+	var e string
+	return json.Unmarshal(m["error"], &e) == nil && e == code
 }
 
 // lenient is a JSON string, number or boolean, kept as its text. Google's

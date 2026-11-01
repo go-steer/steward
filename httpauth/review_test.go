@@ -102,7 +102,7 @@ func TestSealedTokenNeverSentToGoogle(t *testing.T) {
 	var asked atomic.Int32
 	google := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
 		asked.Add(1)
-		http.Error(w, "{}", http.StatusBadRequest)
+		http.Error(w, `{"error":"invalid_token","error_description":"Invalid Value"}`, http.StatusBadRequest)
 	}))
 	defer google.Close()
 	v, err := googletoken.New(googletoken.Config{ClientIDs: []string{clientID}, TokenInfoURL: google.URL + "/tokeninfo", UserInfoURL: google.URL + "/userinfo"})

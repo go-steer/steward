@@ -28,10 +28,14 @@ import (
 	"net/http/httptest"
 	"strconv"
 	"strings"
+	"sync/atomic"
 	"testing"
 	"time"
 
 	"github.com/go-steer/purser"
+	"github.com/go-steer/purser/httpmw"
+
+	"github.com/go-steer/steward/allow"
 )
 
 // cached reports whether Verify left any verdict for token in the cache.
@@ -226,30 +230,43 @@ func TestLoggerReportsUnavailable(t *testing.T) {
 // tokeninfo's 400 invalid_token or userinfo's 401. Any other status (an
 // egress proxy's 403 or 407, a 404 from a moved endpoint) says nothing
 // about the token: ErrUnavailable (a 503 behind purser), never cached.
+// A 400 from tokeninfo without Google's invalid_token body (an egress
+// proxy's) is no verdict either; userinfo's 401 carries only the generic
+// invalid_request, so its status alone decides.
 func TestOnlyGoogleVerdictsAreRefusals(t *testing.T) {
 	t.Parallel()
 	good := info(clientID, "dana@cymbal.example", "true", now.Add(time.Hour))
+	const (
+		notGoogle   = `<html>not Google</html>`
+		googleToken = `{"error":"invalid_token","error_description":"Invalid Value"}`
+		googleUser  = `{"error":"invalid_request","error_description":"Invalid Credentials"}`
+	)
 	for _, c := range []struct {
 		endpoint string
 		status   int
+		body     string
 		refusal  bool
 	}{
-		{"tokeninfo", http.StatusBadRequest, true},
-		{"tokeninfo", http.StatusUnauthorized, false},
-		{"tokeninfo", http.StatusForbidden, false},
-		{"tokeninfo", http.StatusNotFound, false},
-		{"tokeninfo", http.StatusProxyAuthRequired, false},
-		{"tokeninfo", http.StatusTeapot, false},
-		{"userinfo", http.StatusUnauthorized, true},
-		{"userinfo", http.StatusBadRequest, false},
-		{"userinfo", http.StatusForbidden, false},
-		{"userinfo", http.StatusNotFound, false},
-		{"userinfo", http.StatusProxyAuthRequired, false},
+		{"tokeninfo", http.StatusBadRequest, googleToken, true},
+		{"tokeninfo", http.StatusBadRequest, notGoogle, false},
+		{"tokeninfo", http.StatusUnauthorized, notGoogle, false},
+		{"tokeninfo", http.StatusUnauthorized, googleToken, false},
+		{"tokeninfo", http.StatusForbidden, notGoogle, false},
+		{"tokeninfo", http.StatusNotFound, notGoogle, false},
+		{"tokeninfo", http.StatusProxyAuthRequired, notGoogle, false},
+		{"tokeninfo", http.StatusTeapot, notGoogle, false},
+		{"userinfo", http.StatusUnauthorized, googleUser, true},
+		{"userinfo", http.StatusUnauthorized, notGoogle, true},
+		{"userinfo", http.StatusBadRequest, notGoogle, false},
+		{"userinfo", http.StatusBadRequest, googleToken, false},
+		{"userinfo", http.StatusForbidden, notGoogle, false},
+		{"userinfo", http.StatusNotFound, notGoogle, false},
+		{"userinfo", http.StatusProxyAuthRequired, notGoogle, false},
 	} {
-		name := c.endpoint + " " + strconv.Itoa(c.status)
+		name := c.endpoint + " " + strconv.Itoa(c.status) + " " + c.body
 		srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 			if strings.TrimPrefix(r.URL.Path, "/") == c.endpoint {
-				http.Error(w, `<html>not Google</html>`, c.status)
+				http.Error(w, c.body, c.status)
 				return
 			}
 			out := map[string]string{"email": good["email"], "hd": good["hd"]}
@@ -337,5 +354,95 @@ func TestCancelledClientGroupCheckIsNotAnOutage(t *testing.T) {
 	}
 	if out := buf.String(); strings.Contains(out, "level=WARN") || !strings.Contains(out, "level=DEBUG") {
 		t.Errorf("a client that went away was logged as an outage: %q", out)
+	}
+}
+
+// TestTokenInfo400NeedsGoogleBody: tokeninfo's 400 is Google refusing
+// only with Google's body, {"error":"invalid_token"}, which every token
+// Google refuses gets (checked against Google, 2026-11-01). A 400 without
+// it (an egress proxy's, an HTML page, a body cut short) is
+// ErrUnavailable: not cached, and a 503 with Retry-After through purser's
+// middleware rather than a 401 that sends the client to sign in again.
+// Neither the error, the log nor the response carries the token, even
+// from a body that quotes it back. Once Google answers, the same token
+// verifies: nothing was remembered.
+func TestTokenInfo400NeedsGoogleBody(t *testing.T) {
+	t.Parallel()
+	const tok = "ya29.planted-proxy-token"
+	good := info(clientID, "dana@cymbal.example", "true", now.Add(time.Hour))
+	for name, body := range map[string]string{
+		"html":           `<html><body>400 Bad Request</body></html>`,
+		"empty":          ``,
+		"other error":    `{"error":"invalid_request"}`,
+		"error object":   `{"error":{"code":400,"message":"invalid_token","status":"INVALID_ARGUMENT"}}`,
+		"not JSON":       `{"error":"invalid_token"`,
+		"key's case":     `{"Error":"invalid_token"}`,
+		"quotes a token": `request rejected: access_token=` + tok,
+		"cut short":      `{"error":"invalid_token"}`, // sent short of its Content-Length
+	} {
+		t.Run(name, func(t *testing.T) {
+			t.Parallel()
+			var proxy atomic.Bool
+			proxy.Store(true)
+			srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				switch {
+				case proxy.Load() && name == "cut short":
+					w.Header().Set("Content-Length", "500")
+					w.WriteHeader(http.StatusBadRequest)
+					_, _ = w.Write([]byte(body))
+				case proxy.Load():
+					http.Error(w, body, http.StatusBadRequest)
+				case r.URL.Path == "/userinfo":
+					_ = json.NewEncoder(w).Encode(map[string]string{"email": good["email"], "hd": good["hd"]})
+				default:
+					_ = json.NewEncoder(w).Encode(good)
+				}
+			}))
+			defer srv.Close()
+			var buf bytes.Buffer // written only from this goroutine
+			logger := slog.New(slog.NewTextHandler(&buf, nil))
+			v, err := New(Config{ClientIDs: []string{clientID}, TokenInfoURL: srv.URL + "/tokeninfo", UserInfoURL: srv.URL + "/userinfo",
+				Now: func() time.Time { return now }, Logger: logger})
+			if err != nil {
+				t.Fatal(err)
+			}
+			list, _ := allow.Parse([]string{"@cymbal.example"})
+			a, err := NewAuthenticator(v, list)
+			if err != nil {
+				t.Fatal(err)
+			}
+			mw, err := httpmw.NewCaller(httpmw.CallerOptions{Authenticator: a, Enforce: true, Challenge: "Bearer", Logger: logger})
+			if err != nil {
+				t.Fatal(err)
+			}
+			h := mw.Middleware()(http.HandlerFunc(func(http.ResponseWriter, *http.Request) {}))
+
+			_, err = v.Verify(context.Background(), tok)
+			if !errors.Is(err, ErrUnavailable) || !errors.Is(err, purser.ErrUnavailable) || errors.Is(err, ErrInvalid) || errors.Is(err, purser.ErrUnauthenticated) {
+				t.Errorf("tokeninfo 400 %s: %v, want ErrUnavailable and not a credential error", name, err)
+			}
+			if cached(v, tok) {
+				t.Errorf("tokeninfo 400 %s: cached as a verdict", name)
+			}
+			// A body cut short says why, as a 200's does, not "no
+			// invalid_token" (which would point at a proxy).
+			if want := map[bool]string{true: "reading the HTTP 400 answer", false: "HTTP 400 without error invalid_token"}[name == "cut short"]; err != nil && !strings.Contains(err.Error(), want) {
+				t.Errorf("tokeninfo 400 %s: error %q, want it to say %q", name, err, want)
+			}
+			rec := httptest.NewRecorder()
+			h.ServeHTTP(rec, request("Bearer "+tok))
+			if rec.Code != http.StatusServiceUnavailable || rec.Header().Get("Retry-After") == "" || rec.Header().Get("WWW-Authenticate") != "" {
+				t.Errorf("tokeninfo 400 %s through purser: %d, Retry-After %q, challenge %q; want 503 with Retry-After and no challenge",
+					name, rec.Code, rec.Header().Get("Retry-After"), rec.Header().Get("WWW-Authenticate"))
+			}
+			if err != nil && strings.Contains(err.Error(), "planted") || strings.Contains(buf.String(), "planted") || strings.Contains(rec.Body.String(), "planted") {
+				t.Errorf("tokeninfo 400 %s: the token left the request: error %v, log %q, response %q", name, err, buf.String(), rec.Body.String())
+			}
+
+			proxy.Store(false)
+			if id, err := v.Verify(context.Background(), tok); err != nil || id.Email != "dana@cymbal.example" {
+				t.Errorf("after the 400 %s, Google's answer: %+v, %v; want verified", name, id, err)
+			}
+		})
 	}
 }
