@@ -233,7 +233,7 @@ func (s *Server) handleCallback(w http.ResponseWriter, r *http.Request) {
 		fail("access_denied", "Google sign-in was cancelled or refused")
 		return
 	}
-	ctx := r.Context()
+	ctx := withResponse(r.Context(), w) // custody may wait out a nearly spent token
 	t, err := s.cfg.Google.exchange(ctx, s.google.hc, q.Get("code"), s.CallbackURL(), b.Verifier)
 	if err != nil {
 		s.log.WarnContext(ctx, "authserver: Google code exchange failed", "err", err)
@@ -309,7 +309,7 @@ func (s *Server) handleConsentContinue(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	s.clearCookie(w, cookieConsent)
-	g, err := s.cfg.Custody.finish(r.Context(), s.google, p.User, p.Consent, r.URL.Query(), s.ContinueURL())
+	g, err := s.cfg.Custody.finish(withResponse(r.Context(), w), s.google, p.User, p.Consent, r.URL.Query(), s.ContinueURL())
 	if err != nil {
 		s.log.WarnContext(r.Context(), "authserver: custody failed at consent", "custody", s.cfg.Custody.Name(), "email", p.User.Email, "err", err)
 		s.redirectError(w, r, p.Req.RedirectURI, p.Req.State, &authError{custodyError(err), grantFailed})

@@ -505,36 +505,62 @@ and one rotation per refresh, at the client's own pace) until the wait
 ends it; forcing had the same loop, with two vault calls per refresh from
 5 minutes left.
 
-The cost of the wait: about a minute, once per Google token hour, for an
-active client, during which the request holds its refresh token's family
-rotated (the wait runs inside the custody refresh, after the rotation).
-Up to 78 seconds plus the vault and tokeninfo calls; so:
+**Ordering at refresh.** The wait runs before the refresh token's family
+is rotated, through the sealed `Custody` interface's `prepare` step,
+which the token endpoint calls first. A refresh:
 
-- A front end (load balancer, proxy) or client with a shorter timeout in
-  front of the token endpoint or the sign-in callback turns the wait into
-  a failure. When the disconnect reaches the server (a client or proxy
-  closing the connection, an HTTP/2 stream reset), the request's context
-  is cancelled and the refresh token given back, so the retry works; a
-  retry that arrives on another replica before that is a replay.
-  kode-gopher's GKE Gateway allows 900 seconds.
-- The service's `http.Server.WriteTimeout`, if set, must exceed it: over
-  HTTP/1.1 a write timeout does not cancel the request, so the refresh
-  completes, the response is lost, and the client's retry is a replay that
-  revokes the family.
-- A shutdown that does not cancel in-flight requests (`http.Server.Shutdown`
-  does not; a `BaseContext` cancelled on shutdown does) and a pod killed
-  mid-wait never gives the refresh token back: with a shared `Replay`, the
-  retry on another replica is a replay.
-- `RefreshReuseGrace` (at most a minute) cannot cover the wait: a second
-  process of the same client presenting the same refresh token during it
-  is refused (within the grace) or revokes the family (after it), as any
-  concurrent refresh is, over a window of a minute instead of a round
-  trip.
+1. opens and checks the refresh token (expiry, client, resource, scopes);
+2. `prepare`: under `VaultCustody`, all the vault work, the wait
+   included: retrieve, tokeninfo (account, scopes, email, life), the wait
+   and the second retrieve, a forced refresh of a refused token. Nothing
+   is rotated yet, so a failure (the vault or Google failing, the client
+   going away) is `server_error` with nothing to give back.
+   `SealedCustody` does nothing here;
+3. rotates the family (reuse detection, the grace);
+4. checks the allow-list;
+5. answers a refusal from step 2 (`errReauth`) with `invalid_grant`, after
+   the rotation, so the token stays spent and a replayed generation still
+   revokes its family;
+6. issues the grant step 2 prepared, the token every check was made on,
+   with no second vault call. (Under `SealedCustody` the Google refresh
+   happens here, after reuse detection, as before: it is quick, and a
+   refresh token Google rotates is never lost to a refresh that is then
+   refused.)
 
-Moving the wait before the rotation (a custody step the token endpoint
-runs before rotating, so concurrent refreshes wait side by side and then
-resolve within the grace as before) would remove all four; it is a
-change to the token endpoint, left for a follow-up.
+What this ordering means:
+
+- **Concurrent refreshes.** Two processes of one client presenting the
+  same refresh token while the token is nearly spent both wait, side by
+  side, and rotate moments apart. Within `RefreshReuseGrace` the loser is
+  refused without revoking and can re-read the winner's tokens from the
+  shared store. Without a grace it revokes the family, as any concurrent
+  refresh does; that is #18's trade-off, unchanged, and the grace need not
+  cover the wait. If both force the same expired token, the vault may
+  refuse the second ("not the latest token"): `server_error`, nothing
+  rotated, and the retry finds the fresh token.
+- **The client going away, or a front end timing out, during the wait.**
+  Nothing is rotated, so nothing is given back and the retry, on any
+  replica, works. kode-gopher's GKE Gateway allows 900 seconds; a shorter
+  front-end timeout turns that refresh into a retry, not a sign-out.
+- **`http.Server.WriteTimeout` shorter than the wait.** Over HTTP/1.1 a
+  write timeout does not cancel the request, so a refresh that waited and
+  then rotated would have lost its answer, and the retry would be a
+  replay. Before waiting, custody moves the response's write deadline
+  past the wait plus 30 seconds (`http.ResponseController`), on the token
+  endpoint, the sign-in callback and the consent return. A
+  `ResponseWriter` wrapped by middleware without `Unwrap` cannot be
+  extended; there, keep `WriteTimeout` above 108 seconds.
+- **Shutdown or a pod killed mid-wait.** Nothing is rotated until the wait
+  is over. `Shutdown` lets the handler finish (rotate and answer); a kill
+  leaves nothing to give back. Only the moment between the rotation and
+  the answer remains, as for every refresh.
+- **A replayed token** gets the vault work, wait included, before the
+  rotation detects the replay and revokes the family. That costs vault
+  calls, never a token: nothing is issued for it.
+- **The grant ages** between step 2 and step 6 by the rotation and the
+  allow-list check: a token prepared with 75 seconds left has 15 seconds
+  of margin before the access token would be born expired, which
+  `sealAccess` refuses (`server_error`, the rotation given back).
 
 Tested live on 2026-11-01 (kode-gopher v0.4.0, vault custody): the user
 removed the app's access at myaccount.google.com/connections and then

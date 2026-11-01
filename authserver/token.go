@@ -132,7 +132,7 @@ func (s *Server) handleToken(w http.ResponseWriter, r *http.Request) {
 	case "authorization_code":
 		resp, terr = s.exchangeCode(r, c)
 	case "refresh_token":
-		resp, terr = s.refreshTokens(r.Context(), r, c)
+		resp, terr = s.refreshTokens(withResponse(r.Context(), w), r, c)
 	case "client_credentials":
 		resp, terr = s.clientCredentials(r, c)
 	default:
@@ -300,6 +300,21 @@ func (s *Server) refreshTokens(ctx context.Context, r *http.Request, c *client) 
 	if p.Family == "" {
 		return nil, invalidGrant("invalid refresh token")
 	}
+	// Custody work that can block for long runs before the family is
+	// rotated: the vault waits out a Google token too close to expiry to
+	// use (up to 78 seconds), and a family held rotated for that long
+	// turns a client's retry, a concurrent refresh from another of its
+	// processes, a lost response or a restart into a replay that signs the
+	// person out. Nothing is rotated yet, so a failure here, the client
+	// going away included, has nothing to give back. The grant prepared
+	// here, checked against p.User, is the one issued below. A refusal
+	// (errReauth) is answered after the rotation, so the token stays
+	// spent and a replayed one still revokes its family.
+	pre, preErr := s.cfg.Custody.prepare(ctx, s.google, p.User, p.Secret, s.ContinueURL())
+	if preErr != nil && !errors.Is(preErr, errReauth) {
+		s.log.WarnContext(ctx, "authserver: custody failed at refresh", "custody", s.cfg.Custody.Name(), "email", p.User.Email, "err", preErr)
+		return nil, serverError("couldn't refresh the Google grant")
+	}
 	// One expiry for the family and the token that will carry it, so the
 	// family is never forgotten before its newest token expires.
 	exp := s.now().Add(RefreshTTL)
@@ -341,7 +356,14 @@ func (s *Server) refreshTokens(ctx context.Context, r *http.Request, c *client) 
 		release()
 		return nil, serverError("couldn't check the allow-list")
 	}
-	g, err := s.cfg.Custody.refresh(ctx, s.google, p.User, p.Secret, s.ContinueURL())
+	if preErr != nil {
+		s.log.InfoContext(ctx, "authserver: refresh needs a new sign-in", "custody", s.cfg.Custody.Name(), "email", p.User.Email, "reason", preErr)
+		return nil, invalidGrant(preErr.Error())
+	}
+	g, err := pre, error(nil)
+	if g == nil {
+		g, err = s.cfg.Custody.refresh(ctx, s.google, p.User, p.Secret, s.ContinueURL())
+	}
 	if errors.Is(err, errReauth) {
 		s.log.InfoContext(ctx, "authserver: refresh needs a new sign-in", "custody", s.cfg.Custody.Name(), "email", p.User.Email, "reason", err)
 		return nil, invalidGrant(err.Error())

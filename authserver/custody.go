@@ -107,8 +107,17 @@ type Custody interface {
 	// and then finish.
 	begin(ctx context.Context, g *upstream, u User, signIn *googleTokens, continueURI string) (*grant, *consent, error)
 	finish(ctx context.Context, g *upstream, u User, c consent, q url.Values, continueURI string) (*grant, error)
-	// refresh mints a fresh grant at the token endpoint. errReauth means
-	// the user must sign in again.
+	// prepare runs at the token endpoint before the refresh token's
+	// family is rotated, so custody work that can block for long (the
+	// vault waiting out a nearly spent token) never holds the family
+	// rotated. It returns the grant to issue, or nil for refresh to mint
+	// one once the family is rotated. errReauth means the user must sign
+	// in again (the family is still rotated first, and stays so); any
+	// other error is a failure, answered before anything is rotated.
+	prepare(ctx context.Context, g *upstream, u User, secret, continueURI string) (*grant, error)
+	// refresh mints a fresh grant at the token endpoint, after the
+	// rotation, when prepare returned none. errReauth means the user must
+	// sign in again.
 	refresh(ctx context.Context, g *upstream, u User, secret, continueURI string) (*grant, error)
 }
 
@@ -156,6 +165,14 @@ func (SealedCustody) finish(context.Context, *upstream, User, consent, url.Value
 	return nil, errors.New("sealed custody has no consent detour")
 }
 
+// prepare returns no grant: the Google refresh is quick, and runs after
+// the rotation, so a replayed refresh token is refused before Google is
+// asked (and a refresh token Google rotates is never lost to a refresh
+// that is then refused).
+func (SealedCustody) prepare(context.Context, *upstream, User, string, string) (*grant, error) {
+	return nil, nil
+}
+
 func (SealedCustody) refresh(ctx context.Context, g *upstream, u User, secret, _ string) (*grant, error) {
 	if secret == "" {
 		return nil, errReauth
@@ -200,9 +217,10 @@ func (SealedCustody) refresh(ctx context.Context, g *upstream, u User, secret, _
 // force-refreshed once; one Google still accepts never is, and one too
 // close to expiry to use is waited out (up to 78 seconds, plus the vault
 // and tokeninfo calls, during the token request or the sign-in callback)
-// and retrieved again. The service's front end and http.Server
-// WriteTimeout must allow a request that long; see docs/DESIGN.md for
-// what holding a refresh that long costs.
+// and retrieved again. At refresh the wait runs before the refresh
+// token's family is rotated (prepare), so it never holds the family
+// rotated, and it extends the response's write deadline past itself. A
+// front end with a shorter timeout turns that request into a retry.
 type VaultCustody struct {
 	// AuthProvider is the full resource name,
 	// projects/<p>/locations/<l>/authProviders/<name>. Required.
@@ -290,6 +308,13 @@ func (v *VaultCustody) finish(ctx context.Context, g *upstream, u User, c consen
 		return nil, errReauth
 	}
 	return gr, err
+}
+
+// prepare does all of a refresh's vault work, waiting out a nearly spent
+// token included, before the family is rotated; the grant it returns, with
+// every check (account, scopes, email, life) done, is the one issued.
+func (v *VaultCustody) prepare(ctx context.Context, g *upstream, u User, secret, continueURI string) (*grant, error) {
+	return v.refresh(ctx, g, u, secret, continueURI)
 }
 
 func (v *VaultCustody) refresh(ctx context.Context, g *upstream, u User, _, continueURI string) (*grant, error) {
@@ -411,8 +436,17 @@ func (v *VaultCustody) grant(ctx context.Context, g *upstream, u User, r *vaultR
 	}
 }
 
-// wait sleeps for d, or until ctx is done.
+// postWaitBudget is how long a request may still take after waiting out a
+// nearly spent token: a vault retrieve or two, tokeninfo, the rotation,
+// the allow-list and the response.
+const postWaitBudget = 30 * time.Second
+
+// wait sleeps for d, or until ctx is done. It first moves the response's
+// write deadline past the wait (see extendWriteDeadline), so a server
+// WriteTimeout shorter than the wait does not drop the answer to a
+// request that went on to rotate a refresh token's family.
 func (v *VaultCustody) wait(ctx context.Context, d time.Duration) error {
+	extendWriteDeadline(ctx, d+postWaitBudget)
 	if v.sleeper != nil {
 		return v.sleeper.sleep(ctx, d)
 	}
@@ -423,6 +457,26 @@ func (v *VaultCustody) wait(ctx context.Context, d time.Duration) error {
 		return nil
 	case <-ctx.Done():
 		return ctx.Err()
+	}
+}
+
+// responseKey carries the response writer whose write deadline a long
+// custody wait extends.
+type responseKey struct{}
+
+// withResponse lets custody work under ctx extend w's write deadline.
+func withResponse(ctx context.Context, w http.ResponseWriter) context.Context {
+	return context.WithValue(ctx, responseKey{}, w)
+}
+
+// extendWriteDeadline sets the write deadline of the response in ctx, if
+// any, d from now. http.Server.WriteTimeout is a deadline set when the
+// request is read, and over HTTP/1.1 it does not cancel the request: the
+// handler runs on and its answer is lost. A writer that does not support
+// it (a wrapper without Unwrap) is left as it is.
+func extendWriteDeadline(ctx context.Context, d time.Duration) {
+	if w, ok := ctx.Value(responseKey{}).(http.ResponseWriter); ok {
+		_ = http.NewResponseController(w).SetWriteDeadline(time.Now().Add(d))
 	}
 }
 

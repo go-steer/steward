@@ -155,13 +155,16 @@ exported API" in [`CONTRIBUTING.md`](./CONTRIBUTING.md)).
   again, which renews an expired token; the expired token handed back is
   force-refreshed (at refresh, consent then is `server_error` this once,
   in case the vault lags Google by a few seconds; the next refresh reads
-  it as the grant gone). An active client refreshes when its Google token has a minute
-  left, so this refresh used to be `server_error`, which the MCP
-  TypeScript SDK answers with a new browser sign-in, every hour; it now
-  takes up to about a minute instead. The front end in front of the token
-  endpoint and the sign-in callback, and any `http.Server.WriteTimeout`,
-  must allow that long; the refresh token's family stays rotated during
-  the wait (`docs/DESIGN.md`, Vault renewal, lists what that costs). A
+  it as the grant gone). An active client refreshes when its Google
+  token has a minute left, so this refresh used to be `server_error`,
+  which the MCP TypeScript SDK answers with a new browser sign-in, every
+  hour; it now takes up to about a minute instead. At refresh the wait,
+  and all the vault work, runs before the refresh token's family is
+  rotated, so a client giving up, a concurrent refresh from another of its
+  processes or a restart during the wait never finds the family rotated;
+  the wait also moves the response's write deadline past itself, so a
+  shorter `http.Server.WriteTimeout` does not lose the answer. A front end
+  with a shorter timeout than the wait turns that refresh into a retry. A
   token too short to use and not waited out is `server_error`, never a
   sign-out.
 - **`authserver`: a vault token Google's tokeninfo refuses is a refusal.**

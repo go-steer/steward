@@ -598,13 +598,13 @@ func TestVaultRefreshAcrossGoogleExpiry(t *testing.T) {
 	}
 }
 
-// A client that gives up during the wait (its timeout, or a front end's,
-// is shorter) cancels the request: the refresh fails, the family is
-// rotated back, and the client's retry with the same refresh token works
-// rather than being taken for a replay that signs the person out.
+// The vault's wait runs before the refresh token's family is rotated. A
+// client that gives up during it (its timeout, or a front end's, is
+// shorter) leaves nothing rotated and nothing to give back, and its retry
+// with the same refresh token works.
 func TestVaultClientGivesUpDuringTheWait(t *testing.T) {
 	t.Parallel()
-	used := &unrotateSignal{ReplayCache: NewMemoryReplayCache(), unrotated: make(chan struct{}, 1)}
+	used := &countingReplay{ReplayCache: NewMemoryReplayCache()}
 	e := newTestEnv(t, false, func(c *Config) { c.Replay = used })
 	id, first := e.signIn(newBrowser(t))
 	e.google.mu.Lock()
@@ -618,6 +618,7 @@ func TestVaultClientGivesUpDuringTheWait(t *testing.T) {
 		<-ctx.Done()
 		return ctx.Err()
 	}}
+	rotated, unrotated := used.counts()
 	ctx, cancel := context.WithCancel(context.Background())
 	req, _ := http.NewRequestWithContext(ctx, http.MethodPost, e.srv.URL+"/token", strings.NewReader(refreshForm(id, first.Refresh).Encode()))
 	req.Header.Set("Content-Type", "application/x-www-form-urlencoded")
@@ -635,35 +636,138 @@ func TestVaultClientGivesUpDuringTheWait(t *testing.T) {
 		cancel()
 		t.Fatalf("the refresh answered (%v) without waiting out the nearly spent token", err)
 	}
+	if r, u := used.counts(); r != rotated || u != unrotated {
+		t.Errorf("during the wait: %d rotations, %d give-backs; want none", r-rotated, u-unrotated)
+	}
 	cancel()
 	if err := <-done; err == nil {
 		t.Fatal("the abandoned refresh answered")
 	}
-	// The server notices the client went away and gives the token back.
-	select {
-	case <-used.unrotated:
-	case <-time.After(10 * time.Second):
-		t.Fatal("the server never gave the refresh token back")
+	// The server notices the client went away and ends the refresh.
+	deadline := time.Now().Add(10 * time.Second)
+	for !strings.Contains(e.log.String(), "custody failed at refresh") {
+		if time.Now().After(deadline) {
+			t.Fatal("the server never ended the abandoned refresh")
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+	if r, u := used.counts(); r != rotated || u != unrotated {
+		t.Errorf("after the client went away: %d rotations, %d give-backs; want none", r-rotated, u-unrotated)
 	}
 	vc.sleeper = &sleeper{e.vault.sleep}
 	if r := e.token(refreshForm(id, first.Refresh), "", ""); r.status != http.StatusOK {
-		t.Errorf("retry after giving up during the wait: %+v, want the refresh token given back", r)
+		t.Errorf("retry after giving up during the wait: %+v, want the refresh token still usable", r)
 	}
 }
 
-// unrotateSignal reports each Unrotate on unrotated.
-type unrotateSignal struct {
+// countingReplay counts Rotate and Unrotate calls. It embeds only
+// ReplayCache, so the server uses plain Rotate and Unrotate.
+type countingReplay struct {
 	ReplayCache
-	unrotated chan struct{}
+	mu                 sync.Mutex
+	rotates, unrotates int
 }
 
-func (u *unrotateSignal) Unrotate(ctx context.Context, family string, gen uint64) error {
-	err := u.ReplayCache.Unrotate(ctx, family, gen)
+func (c *countingReplay) Rotate(ctx context.Context, family string, gen uint64, exp time.Time) (bool, error) {
+	c.mu.Lock()
+	c.rotates++
+	c.mu.Unlock()
+	return c.ReplayCache.Rotate(ctx, family, gen, exp)
+}
+
+func (c *countingReplay) Unrotate(ctx context.Context, family string, gen uint64) error {
+	c.mu.Lock()
+	c.unrotates++
+	c.mu.Unlock()
+	return c.ReplayCache.Unrotate(ctx, family, gen)
+}
+
+func (c *countingReplay) counts() (rotates, unrotates int) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	return c.rotates, c.unrotates
+}
+
+// Two processes of one client refresh with the same token while the
+// vault's token is nearly spent. The first waits it out; the second,
+// arriving during that wait, finds the family not yet rotated and
+// refreshes (here the vault already has a fresh token for it). The first
+// then loses the rotation race: within the reuse grace it is refused
+// without revoking, so the second's tokens stay valid. (Without a grace
+// it would revoke the family, as any concurrent refresh does.)
+func TestVaultConcurrentRefreshDuringTheWait(t *testing.T) {
+	t.Parallel()
+	e := newTestEnv(t, false, func(c *Config) { c.RefreshReuseGrace = time.Minute })
+	id, first := e.signIn(newBrowser(t))
+	e.google.mu.Lock()
+	last := e.google.mint(alice, ScopeOpenID+" "+ScopeEmail+" "+ScopeCloudPlatform, 60)
+	e.google.mu.Unlock()
+	overrideVault(e, `{"success":{"token":"`+last+`"}}`)
+	vc := e.as.cfg.Custody.(*VaultCustody)
+	waiting, release := make(chan struct{}), make(chan struct{})
+	vc.sleeper = &sleeper{func(ctx context.Context, d time.Duration) error {
+		close(waiting)
+		select {
+		case <-release:
+		case <-ctx.Done():
+			return ctx.Err()
+		}
+		return e.vault.sleep(ctx, d)
+	}}
+	firstDone := make(chan tokenResp, 1)
+	go func() { firstDone <- e.token(refreshForm(id, first.Refresh), "", "") }()
 	select {
-	case u.unrotated <- struct{}{}:
-	default:
+	case <-waiting:
+	case r := <-firstDone:
+		t.Fatalf("the first refresh answered (%+v) without waiting out the nearly spent token", r)
 	}
-	return err
+	second := e.token(refreshForm(id, first.Refresh), "", "")
+	close(release)
+	r1 := <-firstDone
+	if second.status != http.StatusOK {
+		t.Fatalf("a refresh during another's wait: %+v, want it to refresh: the family is not rotated during the wait", second)
+	}
+	if r1.Error != "invalid_grant" {
+		t.Errorf("the waiting refresh, after the other rotated: %+v, want invalid_grant (refused within the grace)", r1)
+	}
+	if r := e.token(refreshForm(id, second.Refresh), "", ""); r.status != http.StatusOK {
+		t.Errorf("the second refresh's token afterwards: %+v, want the family kept", r)
+	}
+}
+
+// A server WriteTimeout shorter than the wait does not lose the answer:
+// the wait moves the response's write deadline past it. (Over HTTP/1.1 a
+// write timeout does not cancel the request, so a lost answer to a
+// refresh that went on to rotate its family would make the client's
+// retry a replay.) This test really waits, about 4 seconds.
+func TestVaultWaitOutlastsWriteTimeout(t *testing.T) {
+	t.Parallel()
+	e := newTestEnv(t, false, nil)
+	id, first := e.signIn(newBrowser(t))
+	e.google.mu.Lock()
+	last := e.google.mint(alice, ScopeOpenID+" "+ScopeEmail+" "+ScopeCloudPlatform, 1)
+	e.google.mu.Unlock()
+	overrideVault(e, `{"success":{"token":"`+last+`"}}`)
+	e.as.cfg.Custody.(*VaultCustody).sleeper = nil // a real wait
+	ts := httptest.NewUnstartedServer(e.srv.Config.Handler)
+	ts.Config.WriteTimeout = 500 * time.Millisecond
+	ts.Start()
+	t.Cleanup(ts.Close)
+	req, _ := http.NewRequest(http.MethodPost, ts.URL+"/token", strings.NewReader(refreshForm(id, first.Refresh).Encode()))
+	req.Header.Set("Content-Type", "application/x-www-form-urlencoded")
+	resp, err := hc.Do(req)
+	if err != nil {
+		t.Fatalf("refresh behind a 500 ms WriteTimeout: %v, want the answer", err)
+	}
+	defer func() { _ = resp.Body.Close() }()
+	var r tokenResp
+	_ = json.NewDecoder(resp.Body).Decode(&r)
+	if resp.StatusCode != http.StatusOK || r.Refresh == "" {
+		t.Fatalf("refresh behind a 500 ms WriteTimeout: %d %+v", resp.StatusCode, r)
+	}
+	if r2 := e.token(refreshForm(id, r.Refresh), "", ""); r2.status != http.StatusOK {
+		t.Errorf("the answered refresh token: %+v", r2)
+	}
 }
 
 // A busy vault ("pending") at refresh is the vault failing, not refusing:
